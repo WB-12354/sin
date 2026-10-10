@@ -1,0 +1,1625 @@
+# -*- coding: utf-8 -*-
+from __future__ import unicode_literals
+
+import os
+
+import urlquick
+from uuid import uuid4
+import base64
+import hashlib
+import time
+from functools import wraps
+from distutils.version import LooseVersion
+from codequick import Script
+from codequick.script import Settings
+from codequick.storage import PersistentDict
+from xbmc import executebuiltin
+from xbmcgui import Dialog, DialogProgress
+from xbmcaddon import Addon
+import xbmc
+import xbmcvfs
+from contextlib import contextmanager
+from collections import defaultdict
+import socket
+import json
+import requests
+import requests.adapters
+import re
+import ssl
+import urllib.request
+from datetime import datetime
+from urllib3.util.retry import Retry
+
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# ─── Force IPv4 ──────────────────────────────────────────────────────────────
+# On Android TV via mobile hotspot, DNS returns both IPv6 (AAAA) and IPv4 (A)
+# records. Android aggressively prefers IPv6, but hotspot doesn't route IPv6
+# traffic properly — the TCP SYN goes out but never gets a SYN-ACK, causing
+# connections to hang indefinitely. Windows prefers IPv4 which is why it works.
+#
+# This patches socket.getaddrinfo to only return IPv4 (AF_INET) results,
+# forcing all urllib3/requests connections to use IPv4.
+import socket as _socket
+_original_getaddrinfo = _socket.getaddrinfo
+
+def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _original_getaddrinfo(host, port, _socket.AF_INET, type, proto, flags)
+
+_socket.getaddrinfo = _ipv4_only_getaddrinfo
+
+from resources.lib.constants import CHANNELS_SRC, DICTIONARY_URL, FEATURED_SRC, VOD_SRC, VOD_CHANNELS_SRC
+
+# ─── Persistent Session ─────────────────────────────────────────────────────
+# A shared requests.Session that reuses TLS connections across calls.
+# This is critical for Android TV on mobile hotspot where initial TLS
+# handshakes can take 15+ seconds. Reusing the session avoids re-handshaking.
+#
+# The Retry adapter handles transient failures automatically.
+_retry_strategy = Retry(
+    total=2,                # 2 retries (3 attempts total)
+    backoff_factor=1,       # 1s, 2s between retries
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST", "HEAD"],
+)
+_adapter = requests.adapters.HTTPAdapter(
+    max_retries=_retry_strategy,
+    pool_connections=4,     # Keep 4 connection pools
+    pool_maxsize=4,         # 4 connections per pool
+)
+
+_session = requests.Session()
+_session.verify = False
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+
+# Suppress InsecureRequestWarning globally
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def get_session():
+    """Return the persistent requests.Session with TLS connection reuse.
+    Critical for Android TV on mobile hotspot where TLS handshakes are slow."""
+    return _session
+
+
+# Pre-warm the TLS connection to JioTV API on module load (background thread).
+# Since reuselanguageinvoker=true, this runs once when utils.py first loads.
+# The SSL handshake is done in the background so play() doesn't have to wait.
+import threading as _threading
+def _prewarm_jiotv_tls():
+    try:
+        _session.head("https://jiotvapi.media.jio.com/", timeout=(15, 5))
+    except Exception:
+        pass  # Non-critical; if it fails, the play() call will just do the handshake
+
+_prewarm = _threading.Thread(target=_prewarm_jiotv_tls, daemon=True)
+_prewarm.start()
+
+
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0)
+    try:
+        s.connect(("8.8.8.8", 80))
+        IP = s.getsockname()[0]
+    except Exception:
+        IP = "127.0.0.1"
+    finally:
+        s.close()
+    return IP
+
+
+def isLoggedIn(func):
+    """
+    Decorator to ensure that a valid login is present when calling a method
+    """
+
+    @wraps(func)
+    def login_wrapper(*args, **kwargs):
+        # Bypass login verification for custom/extra channels
+        if kwargs.get("is_extra") == "true" or kwargs.get("is_extra") is True:
+            return func(*args, **kwargs)
+
+        # Safety Shield: Try to restore settings if they seem missing
+        restoreSettings()
+        
+        with PersistentDict("localdb") as db:
+            username = db.get("username")
+            password = db.get("password")
+            headers = db.get("headers")
+            exp = db.get("exp", 0)
+            
+        bg_refresh = Settings.get_boolean("bg_token_refresh")
+
+        if headers and exp > time.time():
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                # Catch 419 (Authentication Timeout) or 401 (Unauthorized) errors from the server
+                if "419" in str(e) or "401" in str(e):
+                    Script.log("[AUTH] Token expired. Attempting on-demand refresh...", lvl=Script.INFO)
+                    if refresh_token():
+                         return func(*args, **kwargs)
+                    
+                    Script.log(f"[AUTH] Server returned {e}. Token likely invalidated.", lvl=Script.INFO)
+                    with PersistentDict("localdb") as db:
+                        db["exp"] = 0  # Force expiry locally
+                    Script.notify("Session Expired", "Authentication failed. Please login again.")
+                    if Settings.get_boolean("auto_trigger_otp"):
+                        executebuiltin("RunPlugin(plugin://plugin.kodi.jiotv/resources/lib/auth/login/)")
+                    return False
+                raise e
+        elif username and password:
+            login(username, password)
+            return func(*args, **kwargs)
+        elif headers and exp < time.time():
+            Script.log("[AUTH] Session expired locally. Attempting on-demand token refresh...", lvl=Script.INFO)
+            if refresh_token():
+                return func(*args, **kwargs)
+            Script.log("[AUTH] AuthToken refresh failed. Attempting SSO refresh...", lvl=Script.INFO)
+            if refresh_sso_token():
+                if refresh_token():
+                    return func(*args, **kwargs)
+
+            Script.notify("Login Error", "Session expired. Please login again")
+            if Settings.get_boolean("auto_trigger_otp"):
+                executebuiltin(
+                    "RunPlugin(plugin://plugin.kodi.jiotv/resources/lib/auth/login/)"
+                )
+            return False
+        else:
+            Script.notify(
+                "Login Error",
+                "You need to login with Jio Username and password to use this add-on",
+            )
+            executebuiltin(
+                "RunPlugin(plugin://plugin.kodi.jiotv/resources/lib/auth/login/)"
+            )
+            return False
+
+    return login_wrapper
+
+
+def get_jwt_exp(token):
+    try:
+        if not token or "." not in token:
+            return None
+        parts = token.split(".")
+        if len(parts) < 2:
+            return None
+        payload_b64 = parts[1]
+        padding = "=" * (4 - len(payload_b64) % 4)
+        payload_json = base64.b64decode(payload_b64 + padding).decode("utf-8")
+        payload = json.loads(payload_json)
+        return payload.get("exp")
+    except Exception as e:
+        Script.log(f"[AUTH] Failed to parse JWT token: {e}", lvl=Script.WARNING)
+        return None
+
+
+def refresh_token():
+    """Refreshes the short-lived authToken using the refreshToken."""
+    from .constants import TSREFTOK
+    with PersistentDict("localdb") as db:
+        headers = db.get("headers", {})
+        if not headers.get("refreshtoken"):
+            return False
+        
+        payload = {
+            "appName": headers.get("appName", "RJIL_JioTV"),
+            "deviceId": headers.get("deviceid"),
+            "refreshToken": headers.get("refreshtoken")
+        }
+        
+        req_headers = {
+            "accesstoken": headers.get("authtoken"),
+            "uniqueid": headers.get("uniqueid"),
+            "Content-Type": "application/json",
+            "user-agent": "JioTV",
+            "os": "android",
+            "devicetype": "phone",
+            "versioncode": "396"
+        }
+        
+        try:
+            resp = urlquick.post(TSREFTOK, json=payload, headers=req_headers, verify=False, raise_for_status=False).json()
+            if resp.get("authToken"):
+                headers["authtoken"] = resp.get("authToken")
+                headers["refreshtoken"] = resp.get("refreshToken", headers.get("refreshtoken"))
+                db["headers"] = headers
+                
+                # Extract expiry from the JWT
+                jwt_exp = get_jwt_exp(resp.get("authToken"))
+                db["exp"] = jwt_exp if jwt_exp else (time.time() + 864000)
+                
+                Script.log("[AUTH] AuthToken refreshed successfully.", lvl=Script.INFO)
+                return True
+        except Exception as e:
+            Script.log(f"[AUTH] AuthToken refresh failed: {e}", lvl=Script.ERROR)
+    return False
+
+
+def refresh_sso_token():
+    """Refreshes the long-lived ssoToken."""
+    from .constants import LOTPREF
+    with PersistentDict("localdb") as db:
+        headers = db.get("headers", {})
+        if not headers.get("ssotoken"):
+            return False
+            
+        req_headers = {
+            "deviceid": headers.get("deviceid"),
+            "ssotoken": headers.get("ssotoken"),
+            "uniqueid": headers.get("uniqueid"),
+            "User-Agent": "JioTV",
+            "os": "android",
+            "devicetype": "phone",
+            "versioncode": "396"
+        }
+        
+        try:
+            resp = urlquick.get(LOTPREF, headers=req_headers, verify=False, raise_for_status=False).json()
+            if resp.get("ssoToken"):
+                headers["ssotoken"] = resp.get("ssoToken")
+                db["headers"] = headers
+                db["exp"] = time.time() + 864000 # Extend by 10 days
+                Script.log("[AUTH] SSOToken refreshed successfully.", lvl=Script.INFO)
+                return True
+        except Exception as e:
+            Script.log(f"[AUTH] SSOToken refresh failed: {e}", lvl=Script.ERROR)
+    return False
+
+
+def login(username, password, mode="unpw"):
+    resp = None
+    if mode == "otp":
+        mobile = "+91" + username
+        otpbody = {
+            "number": base64.b64encode(mobile.encode("ascii")).decode("ascii"),
+            "otp": password,
+            "deviceInfo": {
+                "consumptionDeviceName": "unknown sdk_google_atv_x86",
+                "info": {
+                    "type": "android",
+                    "platform": {"name": "generic_x86"},
+                    "androidId": str(uuid4()),
+                },
+            },
+        }
+        resp = urlquick.post(
+            "https://jiotvapi.media.jio.com/userservice/apis/v1/loginotp/verify",
+            json=otpbody,
+            headers={
+                "User-Agent": "okhttp/4.2.2",
+                "devicetype": "phone",
+                "os": "android",
+                "appname": "RJIL_JioTV",
+            },
+            max_age=-1,
+            verify=False,
+            raise_for_status=False,
+        ).json()
+    else:
+        body = {
+            "identifier": username if "@" in username else "+91" + username,
+            "password": password,
+            "rememberUser": "T",
+            "upgradeAuth": "Y",
+            "returnSessionDetails": "T",
+            "deviceInfo": {
+                "consumptionDeviceName": "ZUK Z1",
+                "info": {
+                    "type": "android",
+                    "platform": {"name": "ham", "version": "8.0.0"},
+                    "androidId": str(uuid4()),
+                },
+            },
+        }
+        resp = urlquick.post(
+            "https://api.jio.com/v3/dip/user/{0}/verify".format(mode),
+            json=body,
+            headers={
+                "User-Agent": "JioTV",
+                "x-api-key": "l7xx75e822925f184370b2e25170c5d5820a",
+                "Content-Type": "application/json",
+            },
+            max_age=-1,
+            verify=False,
+            raise_for_status=False,
+        ).json()
+    if resp.get("ssoToken", "") != "":
+        _CREDS = {
+            "ssotoken": resp.get("ssoToken"),
+        "userid": resp.get("sessionAttributes", {}).get("user", {}).get("uid"),
+        "uniqueid": resp.get("sessionAttributes", {}).get("user", {}).get("unique"),
+        "crmid": resp.get("sessionAttributes", {}).get("user", {}).get("subscriberId"),
+        "subscriberid": resp.get("sessionAttributes", {}).get("user", {}).get("subscriberId"),
+        "authtoken": resp.get("authToken", ""),
+        "refreshtoken": resp.get("refreshToken", ""),
+        "jtoken": resp.get("jToken", ""),
+        "deviceid": resp.get("deviceId", ""),
+        }
+        headers = {
+            "appName": "RJIL_JioTV",
+            "deviceId": resp.get("deviceId"),
+            "devicetype": "phone",
+            "os": "android",
+            "osversion": "9",
+            "partner": "jiotvvod",
+            "user-agent": "plaYtv/7.1.5 (Linux;Android 9) ExoPlayerLib/2.11.7",
+            "usergroup": "tvYR7NSNn7rymo3F",
+            "versioncode": "396",
+            "platform": "ANDROID_PHONE",
+            "dm": "ZUK ZUK Z1",
+            "authtoken":resp.get("authToken"),
+            "ssotoken": resp.get("ssoToken"),
+        }
+        
+        headers.update(_CREDS)
+        with PersistentDict("localdb") as db:
+            db["headers"] = headers
+            # Log the full response to inspect for server-side expiry hints
+            Script.log(f"[LOGIN] Response: {resp}", lvl=Script.INFO)
+            
+            # Extract expiry from JWT authtoken, fallback to default 10 days for OTP or 5 days for Password
+            jwt_exp = get_jwt_exp(resp.get("authToken", ""))
+            if jwt_exp:
+                db["exp"] = jwt_exp
+            else:
+                db["exp"] = time.time() + 864000
+                if mode == "unpw":
+                    db["exp"] = time.time() + 432000
+                    
+            if mode == "unpw":
+                db["username"] = username
+                db["password"] = password
+        
+        # Backup after successful login
+        backupSettings()
+        
+        Script.notify("Login Success", "")
+        return None
+    else:
+        Script.log(resp, lvl=Script.INFO)
+        msg = resp.get("message", "Unknow Error")
+        Script.notify("Login Failed", msg)
+        return msg
+
+
+def sendOTPV2(mobile):
+    if "+91" not in mobile:
+        mobile = "+91" + mobile
+    body = {"number": base64.b64encode(mobile.encode("ascii")).decode("ascii")}
+    Script.log(body, lvl=Script.ERROR)
+    resp = urlquick.post(
+        "https://jiotvapi.media.jio.com/userservice/apis/v1/loginotp/send",
+        json=body,
+        headers={
+            "user-agent": "okhttp/4.2.2",
+            "os": "android",
+            "host": "jiotvapi.media.jio.com",
+            "devicetype": "phone",
+            "appname": "RJIL_JioTV",
+        },
+        max_age=-1,
+        verify=False,
+        raise_for_status=False,
+    )
+    if resp.status_code != 204:
+        return resp.json().get("errors", [{}])[-1].get("message")
+    return None
+
+
+def logout():
+    with PersistentDict("localdb") as db:
+        del db["headers"]
+    Script.notify("You've been logged out", "")
+
+
+def getHeaders():
+    with PersistentDict("localdb") as db:
+        return db.get("headers", False)
+
+
+def getCachedChannels():
+    CACHE_VERSION = "v3.1_hybrid_v3"  # Bump this to force re-fetch
+    with PersistentDict("localdb") as db:
+        channelList = db.get("channelList", False)
+        cacheVersion = db.get("_channelCacheVersion", "")
+        # Auto-invalidate stale cache from old v3.0-only code
+        if channelList and cacheVersion != CACHE_VERSION:
+            Script.log(f"[CHANNELS] Cache version mismatch ({cacheVersion} != {CACHE_VERSION}), refreshing...", lvl=Script.INFO)
+            channelList = False
+        if not channelList:
+            try:
+                # Use urlquick with caching to speed up loading
+                v14_url = "https://jiotvapi.cdn.jio.com/apis/v1.4/getMobileChannelList/get/?langId=6&devicetype=phone&os=android&usertype=JIO&version=396"
+                v31_url = "https://jiotvapi.cdn.jio.com/apis/v3.1/getMobileChannelList/get/?langId=6&os=android&devicetype=phone&usertype=JIO&version=389"
+                
+                headers = {"User-Agent": "okhttp/4.2.2"}
+                
+                # Fetch v1.4 channels (primary source - contains Sony, Zee networks)
+                v14_channels = urlquick.get(v14_url, headers=headers, max_age=86400, timeout=15).json().get("result", [])
+
+                # Fetch v3.1 channels (secondary source - contains Star, Disney networks) and merge
+                try:
+                    v31_channels = urlquick.get(v31_url, headers=headers, max_age=86400, timeout=15).json().get("result", [])
+                    
+                    # Build set of v1.4 channel IDs for fast lookup
+                    v14_ids = {ch.get("channel_id") for ch in v14_channels}
+
+                    # Add any v3.1-only channels
+                    extra_count = 0
+                    for ch in v31_channels:
+                        if ch.get("channel_id") not in v14_ids:
+                            v14_channels.append(ch)
+                            extra_count += 1
+                            
+                    Script.log(f"[CHANNELS] Merged {extra_count} unique channels from v3.1 into v1.4", lvl=Script.INFO)
+                except Exception as e:
+                    Script.log(f"[CHANNELS] v3.1 merge failed: {e}", lvl=Script.INFO)
+
+                db["channelList"] = v14_channels
+                db["_channelCacheVersion"] = CACHE_VERSION
+            except:
+                Script.notify("Connection error ", "Retry after sometime")
+        return db.get("channelList", False)
+
+
+def getCachedDictionary():
+    CACHE_VERSION = "v2"  # Bump this to force re-fetch
+    with PersistentDict("localdb") as db:
+        dictionary = db.get("dictionary", False)
+        dictVersion = db.get("_dictCacheVersion", "")
+        # Auto-invalidate stale cache
+        if dictionary and dictVersion != CACHE_VERSION:
+            Script.log(f"[DICT] Cache version mismatch, refreshing...", lvl=Script.INFO)
+            dictionary = False
+        if not dictionary:
+            try:
+                r = urlquick.get(
+                    "https://jiotvapi.cdn.jio.com/apis/v1.3/dictionary/dictionary?langId=6",
+                    headers={"User-Agent": "okhttp/4.2.2"},
+                    max_age=604800, # 7 days
+                    timeout=15
+                )
+                import json
+                db["dictionary"] = json.loads(r.content.decode('utf-8-sig'))
+                db["_dictCacheVersion"] = CACHE_VERSION
+            except:
+                Script.notify(
+                    "dictionary url -Connection error ", "Retry after sometime"
+                )
+        return db.get("dictionary", False)
+
+
+def getFeatured():
+    try:
+        resp = urlquick.get(
+            FEATURED_SRC,
+            verify=False,
+            headers={
+                "usergroup": "tvYR7NSNn7rymo3F",
+                "os": "android",
+                "devicetype": "phone",
+                "versionCode": "396",
+            },
+            max_age=3600, # 1 hour
+            timeout=15
+        ).json()
+        return resp.get("featuredNewData", [])
+    except:
+        # Script.notify("Connection error ", "Retry after sometime")
+        pass
+
+
+def getVODContent():
+    """
+    Get VOD-like content from available sources.
+    Since dedicated VOD endpoints don't exist, extract VOD-like content from featured data.
+    """
+    try:
+        # Get featured content which actually works
+        featured_data = getFeatured()
+        
+        # Check if featured_data is valid
+        if not featured_data:
+            Script.log("No featured data available for VOD extraction", lvl=Script.WARNING)
+            return []
+        
+        vod_like_content = []
+        
+        for category in featured_data:
+            if isinstance(category, dict) and "data" in category:
+                for item in category.get("data", []):
+                    # Extract VOD-like content: not live, not future, has poster
+                    show_status = item.get("showStatus", "")
+                    has_poster = item.get("episodePoster", "")
+                    
+                    if (show_status not in ["Now", "future"] and 
+                        has_poster and 
+                        item.get("description", "")):
+                        
+                        # Mark as VOD content
+                        item["_isVOD"] = True
+                        item["_vodCategory"] = category.get("name", "General")
+                        vod_like_content.append(item)
+        
+        if vod_like_content:
+            Script.log(f"Found {len(vod_like_content)} VOD-like items from featured content", lvl=Script.INFO)
+            return vod_like_content
+        else:
+            Script.log("No VOD-like content found in featured data", lvl=Script.INFO)
+            return []
+            
+    except Exception as e:
+        Script.log(f"Failed to extract VOD from featured: {e}", lvl=Script.ERROR)
+        return []
+
+
+def getVODChannels():
+    """
+    Get channels that support VOD/catchup content.
+    Determined simply by the isCatchupAvailable flag from the API.
+    """
+    try:
+        all_channels = getCachedChannels()
+        vod_channels = []
+        
+        for channel in all_channels:
+            has_catchup = channel.get("isCatchupAvailable", False)
+            
+            # Include all channels that have catchup (VOD) available
+            if has_catchup:
+                channel["_isVODChannel"] = True
+                vod_channels.append(channel)
+        
+        if vod_channels:
+            # Sort by channel name initially
+            vod_channels.sort(key=lambda x: str(x.get("channel_name", "")).lower())
+            Script.log(f"Found {len(vod_channels)} VOD-capable channels from {len(all_channels)} total channels", lvl=Script.INFO)
+            return vod_channels
+        else:
+            Script.log("No VOD-capable channels found", lvl=Script.INFO)
+            return []
+            
+    except Exception as e:
+        Script.log(f"Failed to get VOD channels: {e}", lvl=Script.ERROR)
+        return []
+
+
+def getChannelVODContent(channel_id, offset_days=0):
+    """
+    Get VOD-like content for a specific channel using catchup EPG data.
+    offset_days: 0 for most recent, 1 for yesterday, etc.
+    """
+    try:
+        headers = getHeaders()
+        if not headers:
+            Script.log("No headers available for channel VOD", lvl=Script.ERROR)
+            return []
+        
+        # Get EPG/catchup data for the channel with offset
+        # Use negative offset to go back in time
+        epg_url = f"https://jiotvapi.cdn.jio.com/apis/v1.3/getepg/get?offset={-offset_days}&channel_id={channel_id}&langId=6"
+        
+        headers = dict(headers)
+        headers["User-Agent"] = "okhttp/4.2.2"
+        resp = urlquick.get(epg_url, headers=headers, verify=False, max_age=1800, timeout=15)
+        epg_data = resp.json()
+        
+        vod_content = []
+        current_time = int(time.time() * 1000)
+        
+        for show in epg_data.get("epg", []):
+            # Include past shows with mobile catchup availability (VOD-like)
+            # Note: isCatchupAvailable indicates mobile OTT catchup support (stbCatchupAvailable is for JioFiber STB)
+            if (show.get("startEpoch", 0) < current_time) and show.get("isCatchupAvailable"):
+                
+                # Mark as channel VOD content with offset info
+                show["_isChannelVOD"] = True
+                show["_channelId"] = channel_id
+                show["_vodType"] = "catchup"
+                show["_offsetDays"] = offset_days
+                
+                vod_content.append(show)
+        
+        # Sort by start time in descending order (most recent first)
+        vod_content.sort(key=lambda x: x.get("startEpoch", 0), reverse=True)
+        
+        if vod_content:
+            Script.log(f"Found {len(vod_content)} VOD items for channel {channel_id} (offset: {offset_days} days)", lvl=Script.INFO)
+            return vod_content
+        else:
+            Script.log(f"No VOD content found for channel {channel_id} (offset: {offset_days} days)", lvl=Script.INFO)
+            return []
+            
+    except Exception as e:
+        Script.log(f"Failed to get channel VOD content: {e}", lvl=Script.ERROR)
+        return []
+
+
+def cleanLocalCache():
+    try:
+        with PersistentDict("localdb") as db:
+            del db["channelList"]
+            del db["dictionary"]
+    except:
+        Script.notify("Cache", "Cleaned")
+
+
+def backupSettings():
+    """Backup critical user settings to a persistent file to prevent loss during upgrades."""
+    try:
+        # Saving directly to Kodi's root userdata folder means the backup survives an addon uninstallation
+        backup_file = xbmcvfs.translatePath("special://userdata/.jiotv_backup.json")
+        
+        # Collect critical data
+        mobile = Addon('plugin.kodi.jiotv').getSetting("mobile")
+        with PersistentDict("localdb") as db:
+            headers = db.get("headers")
+            username = db.get("username")
+            password = db.get("password")
+            
+        data = {
+            "mobile": mobile,
+            "headers": headers,
+            "username": username,
+            "password": password,
+            "timestamp": time.time()
+        }
+        
+        with open(backup_file, "w") as f:
+            json.dump(data, f)
+            
+        Script.log("[SAFETY] User settings backed up successfully", lvl=Script.INFO)
+    except Exception as e:
+        Script.log(f"[SAFETY] Failed to backup settings: {e}", lvl=Script.ERROR)
+
+
+def restoreSettings():
+    """Restore critical user settings from persistent backup if they are missing."""
+    try:
+        addon = Addon('plugin.kodi.jiotv')
+        current_mobile = addon.getSetting("mobile")
+        
+        with PersistentDict("localdb") as db:
+            has_headers = "headers" in db
+            
+        # If we have both, no need to restore
+        if current_mobile and has_headers:
+            return
+            
+        backup_file = xbmcvfs.translatePath("special://userdata/.jiotv_backup.json")
+        
+        if not os.path.exists(backup_file):
+            return
+            
+        with open(backup_file, "r") as f:
+            data = json.load(f)
+            
+        restored = False
+        
+        # Restore mobile if missing
+        if not current_mobile and data.get("mobile"):
+            addon.setSetting("mobile", data["mobile"])
+            restored = True
+            
+        # Restore headers/credentials if missing
+        with PersistentDict("localdb") as db:
+            if not "headers" in db and data.get("headers"):
+                db["headers"] = data["headers"]
+                if data.get("username"): db["username"] = data["username"]
+                if data.get("password"): db["password"] = data["password"]
+                restored = True
+                
+        if restored:
+            Script.log("[SAFETY] User settings restored from persistent backup", lvl=Script.INFO)
+            Script.notify("JioTV", "Settings restored from backup")
+            
+    except Exception as e:
+        Script.log(f"[SAFETY] Failed to restore settings: {e}", lvl=Script.ERROR)
+
+
+def backupFavourites():
+    src = xbmcvfs.translatePath("special://userdata/favourites.xml")
+    dest = xbmcvfs.translatePath("special://userdata/jiotv_favourites_backup.xml")
+    if xbmcvfs.exists(src):
+        try:
+            if xbmcvfs.exists(dest):
+                xbmcvfs.delete(dest)
+            xbmcvfs.copy(src, dest)
+            Script.notify("Favourites", "Favourites backed up successfully")
+        except Exception as e:
+            Script.log(f"Failed to backup favourites: {e}", lvl=Script.ERROR)
+            Script.notify("Error", "Failed to backup favourites")
+    else:
+        Script.notify("Favourites Error", "No favourites.xml found to backup")
+
+def restoreFavourites():
+    src = xbmcvfs.translatePath("special://userdata/jiotv_favourites_backup.xml")
+    dest = xbmcvfs.translatePath("special://userdata/favourites.xml")
+    if xbmcvfs.exists(src):
+        try:
+            if xbmcvfs.exists(dest):
+                xbmcvfs.delete(dest)
+            xbmcvfs.copy(src, dest)
+            Script.notify("Favourites", "Favourites restored. Restart Kodi to apply.")
+        except Exception as e:
+            Script.log(f"Failed to restore favourites: {e}", lvl=Script.ERROR)
+            Script.notify("Error", "Failed to restore favourites")
+    else:
+        Script.notify("Favourites Error", "No backup found to restore")
+
+def shareFavourites():
+    src = xbmcvfs.translatePath("special://userdata/favourites.xml")
+    if not xbmcvfs.exists(src):
+        Script.notify("Favourites Error", "No favourites.xml found to share")
+        return
+        
+    dialog = Dialog()
+    dest_dir = dialog.browse(3, "Select folder to export favourites", "files")
+    if dest_dir:
+        # Construct path keeping Kodi VFS compatibility in mind
+        if not dest_dir.endswith('/') and not dest_dir.endswith('\\'):
+            dest_dir += '/'
+        dest = dest_dir + "favourites.xml"
+        try:
+            if xbmcvfs.exists(dest):
+                xbmcvfs.delete(dest)
+            xbmcvfs.copy(src, dest)
+            Script.notify("Favourites", "Favourites exported successfully")
+        except Exception as e:
+            Script.log(f"Failed to export favourites: {e}", lvl=Script.ERROR)
+            Script.notify("Error", "Failed to export favourites")
+
+def importFavourites():
+    dialog = Dialog()
+    src = dialog.browse(1, "Select favourites file to import", "files", ".xml")
+    if src:
+        dest = xbmcvfs.translatePath("special://userdata/favourites.xml")
+        try:
+            if xbmcvfs.exists(dest):
+                xbmcvfs.delete(dest)
+            xbmcvfs.copy(src, dest)
+            Script.notify("Favourites", "Favourites imported. Restart Kodi to apply.")
+        except Exception as e:
+            Script.log(f"Failed to import favourites: {e}", lvl=Script.ERROR)
+            Script.notify("Error", "Failed to import favourites")
+
+
+def getChannelHeaders():
+    headers = getHeaders()
+    return {
+        "ssoToken": headers["ssotoken"],
+        "userId": headers["userid"],
+        "uniqueId": str(headers["uniqueid"]),
+        "crmid": str(headers["crmid"]),
+        "user-agent": "plaYtv/7.1.5 (Linux;Android 9) ExoPlayerLib/2.11.7",
+        "deviceid": headers["deviceId"],
+        "devicetype": "phone",
+        "os": "B2G",
+        "osversion": "2.5",
+        "versioncode": "353",
+    }
+
+
+def getSonyHeaders(channel_id=None, languageId=None):
+    sony=getHeaders()
+    return {
+        "Host": "jiotvapi.media.jio.com",
+            "Appkey": "NzNiMDhlYzQyNjJm",
+            "Devicetype": "phone",
+            "Os": "android",
+            "Deviceid": sony["deviceId"],
+            "Osversion": "13",
+            "Dm": "Google Pixel 5",
+            "Uniqueid": sony["deviceId"],
+            "Usergroup": "tvYR7NSNn7rymo3F",
+            "Languageid": languageId if languageId else "6",
+            "Userid": sony["userid"],
+            "Sid": "892898ba-f9de-4572-b6c2-e717b0ad",
+            "Crmid": sony["subscriberid"],
+            "Isott": "false",
+            "Channel_id": str(channel_id) if channel_id else "471",
+            "Langid": languageId if languageId else "",
+            "Camid": "",
+            "ssoToken": sony["ssotoken"],
+            "Accesstoken": sony["authtoken"],
+            "Subscriberid": sony["subscriberid"],
+            "analyticsId": sony["deviceId"],
+            "Lbcookie": "1",
+            "Versioncode": "389",
+            "Content-Type": "application/x-www-form-urlencoded",
+        # "Content-Length": "110",
+            "Accept-Encoding": "gzip, deflate, br",
+            "user-agent": "okhttp/4.2.2",
+            "Connection": "keep-alive",
+    }
+
+# Zee5 headers
+
+def getZeeHeaders(host=None):
+    return {
+    "Host": host,
+    "accept": "*/*",
+    "accept-encoding": "gzip, deflate, br, zstd",
+    "accept-language": "en-US,en;q=0.9",
+    "origin": "https://www.zee5.com",
+    "priority": "u=1, i",
+    "referer": "https://www.zee5.com/",
+    "sec-ch-ua": '"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+}
+    
+def zeeCookie(zee_channelid=None):
+    url = "https://spapi.zee5.com/singlePlayback/getDetails/secure"
+    params = {
+        "channel_id": zee_channelid,
+        "device_id": "90abf228-06b1-42ae-aa65-4979df5bcef6",
+        "platform_name": "desktop_web",
+        "translation": "en",
+        "user_language": "te",
+        "country": "IN",
+        "state": "TS",
+        "app_version": "4.26.1",
+        "user_type": "guest",
+        "check_parental_control": "false",
+        "ppid": "90abf228-06b1-42ae-aa65-4979df5bcef6",
+        "version": "12"
+    }
+
+    json_data = {
+        "x-access-token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJwbGF0Zm9ybV9jb2RlIjoiV2ViQCQhdDM4NzEyIiwiaXNzdWVkQXQiOiIyMDI1LTEwLTIyVDAzOjQ4OjA1LjAyOVoiLCJwcm9kdWN0X2NvZGUiOiJ6ZWU1QDk3NSIsInR0bCI6ODY0MDAwMDAsImlhdCI6MTc2MTEwNDg4NX0.8HnOYX7GmvGGWWiPfYPlvJk55Bzmjd1qEQIx6ueOnCs",
+        "X-Z5-Guest-Token": "90abf228-06b1-42ae-aa65-4979df5bcef6",
+        "x-dd-token": "eyJzY2hlbWFfdmVyc2lvbiI6IjEiLCJvc19uYW1lIjoiTi9BIiwib3NfdmVyc2lvbiI6Ik4vQSIsInBsYXRmb3JtX25hbWUiOiJDaHJvbWUiLCJwbGF0Zm9ybV92ZXJzaW9uIjoiMTA0IiwiZGV2aWNlX25hbWUiOiIiLCJhcHBfbmFtZSI6IldlYiIsImFwcF92ZXJzaW9uIjoiMi41Mi4zMSIsInBsYXllcl9jYXBhYmlsaXRpZXMiOnsiYXVkaW9fY2hhbm5lbCI6WyJTVEVSRU8iXSwidmlkZW9fY29kZWMiOlsiSDI2NCJdLCJjb250YWluZXIiOlsiTVA0IiwiVFMiXSwicGFja2FnZSI6WyJEQVNIIiwiSExTIl0sInJlc29sdXRpb24iOlsiMjQwcCIsIlNEIiwiSEQiLCJGSEQiXSwiZHluYW1pY19yYW5nZSI6WyJTRFIiXX0sInNlY3VyaXR5X2NhcGFiaWxpdGllcyI6eyJlbmNyeXB0aW9uIjpbIldJREVWSU5FX0FFU19DVFIiXSwid2lkZXZpbmVfc2VjdXJpdHlfbGV2ZWwiOlsiTDMiXSwiaGRjcF92ZXJzaW9uIjpbIkhEQ1BfVjEiLCJIRENQX1YyIiwiSERDUF9WMl8xIiwiSERDUF9WMl8yIl19fQ=="
+    }
+
+    headers = {
+        "accept": "application/json",
+        "accept-encoding": "gzip, deflate, br",
+        "accept-language": "en-US,en;q=0.9",
+        "origin": "https://www.zee5.com",
+        "referer": "https://www.zee5.com/",
+        "content-type": "application/json",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, params=params, json=json_data, timeout=15)
+        if resp.status_code == 403:
+            return None
+        result = resp.json()
+    except Exception as e:
+        return None
+
+    m3u8_response = result.get("keyOsDetails", {}).get("video_token")
+    if not m3u8_response:
+        return None
+
+    cookie = "?" + m3u8_response.split("?", 1)[1] if "?" in m3u8_response else ""
+
+    return cookie
+    
+        
+
+
+def getChannelHeadersWithHost():
+    return {
+        "deviceType": "phone",
+        "host": "tv.media.jio.com",
+        "os": "B2G",
+        "versioncode": "396",
+        "Conetent-Type": "application/json",
+    }
+
+
+def getTokenParams():
+    def magic(x):
+        return (
+            base64.b64encode(hashlib.md5(x.encode()).digest())
+            .decode()
+            .replace("=", "")
+            .replace("+", "-")
+            .replace("/", "_")
+            .replace("\r", "")
+            .replace("\n", "")
+        )
+
+    pxe = str(int(time.time() + (3600 * 9.2)))
+    jct = magic("cutibeau2ic9p-O_v1qIyd6E-rf8_gEOQ" + pxe)
+    return {"jct": jct, "pxe": pxe, "st": "9p-O_v1qIyd6E-rf8_gEOQ"}
+
+
+def check_addon(addonid, minVersion=False):
+    """Checks if selected add-on is installed."""
+    try:
+        curVersion = Script.get_info("version", addonid)
+        # Script.notify("version" , curVersion)
+        if minVersion and LooseVersion(curVersion) < LooseVersion(minVersion):
+            Script.log(
+                "{addon} {curVersion} doesn't setisfy required version {minVersion}.".format(
+                    addon=addonid, curVersion=curVersion, minVersion=minVersion
+                )
+            )
+            Dialog().ok(
+                "Error",
+                "{minVersion} version of {addon} is required to play this content.".format(
+                    addon=addonid, minVersion=minVersion
+                ),
+            )
+            return False
+        return True
+    except RuntimeError:
+        Script.log("{addon} is not installed.".format(addon=addonid))
+        if not _install_addon(addonid):
+            # inputstream is missing on system
+            Dialog().ok(
+                "Error",
+                "[B]{addon}[/B] is missing on your Kodi install. This add-on is required to play this content.".format(
+                    addon=addonid
+                ),
+            )
+            return False
+        return True
+
+
+def _install_addon(addonid):
+    """Install addon."""
+    try:
+        # See if there's an installed repo that has it
+        executebuiltin("InstallAddon({})".format(addonid), wait=True)
+
+        # Check if add-on exists!
+        version = Script.get_info("version", addonid)
+
+        Script.log(
+            "{addon} {version} add-on installed from repo.".format(
+                addon=addonid, version=version
+            )
+        )
+        return True
+    except RuntimeError:
+        Script.log("{addon} add-on not installed.".format(addon=addonid))
+        return False
+
+
+def quality_to_enum(quality_str, arr_len):
+    """Converts quality into a numeric value. Max clips to fall within valid bounds."""
+    mapping = {
+        "Best": arr_len - 1,
+        "High": max(arr_len - 2, arr_len - 3),
+        "Medium+": max(arr_len - 3, arr_len - 4),
+        "Medium": max(2, arr_len - 3),
+        "Low": min(2, arr_len - 3),
+        "Lower": 1,
+        "Lowest": 0,
+    }
+    if quality_str in mapping:
+        return min(mapping[quality_str], arr_len - 1)
+    return 0
+
+
+_signals = defaultdict(list)
+_skip = defaultdict(int)
+
+
+def emit(signal, *args, **kwargs):
+    if _skip[signal] > 0:
+        _skip[signal] -= 1
+        return
+
+    for f in _signals.get(signal, []):
+        f(*args, **kwargs)
+
+
+class Monitor(xbmc.Monitor):
+    def onSettingsChanged(self):
+        emit("on_settings_changed")
+
+
+monitor = Monitor()
+
+
+def kodi_rpc(method, params=None, raise_on_error=False):
+    try:
+        payload = {"jsonrpc": "2.0", "id": 1}
+        payload.update({"method": method})
+        if params:
+            payload["params"] = params
+
+        data = json.loads(xbmc.executeJSONRPC(json.dumps(payload)))
+        if "error" in data:
+            raise Exception(
+                'Kodi RPC "{} {}" returned Error: "{}"'.format(
+                    method, params or "", data["error"].get("message")
+                )
+            )
+
+        return data["result"]
+    except Exception as e:
+        if raise_on_error:
+            raise
+        else:
+            return {}
+
+
+def set_kodi_setting(key, value):
+    return kodi_rpc("Settings.SetSettingValue", {"setting": key, "value": value})
+
+
+def same_file(path_a, path_b):
+    if path_a.lower().strip() == path_b.lower().strip():
+        return True
+
+    stat_a = os.stat(path_a) if os.path.isfile(path_a) else None
+    if not stat_a:
+        return False
+
+    stat_b = os.stat(path_b) if os.path.isfile(path_b) else None
+    if not stat_b:
+        return False
+
+    return (
+        (stat_a.st_dev == stat_b.st_dev)
+        and (stat_a.st_ino == stat_b.st_ino)
+        and (stat_a.st_mtime == stat_b.st_mtime)
+    )
+
+
+def safe_copy(src, dst, del_src=False):
+    src = xbmcvfs.translatePath(src)
+    dst = xbmcvfs.translatePath(dst)
+
+    if not xbmcvfs.exists(src) or same_file(src, dst):
+        return
+
+    if xbmcvfs.exists(dst):
+        if xbmcvfs.delete(dst):
+            Script.log("Deleted: {}".format(dst))
+        else:
+            Script.log("Failed to delete: {}".format(dst))
+
+    if xbmcvfs.copy(src, dst):
+        Script.log("Copied: {} > {}".format(src, dst))
+    else:
+        Script.log("Failed to copy: {} > {}".format(src, dst))
+
+    if del_src:
+        xbmcvfs.delete(src)
+
+
+@contextmanager
+def busy():
+    xbmc.executebuiltin("ActivateWindow(busydialognocancel)")
+    try:
+        yield
+    finally:
+        xbmc.executebuiltin("Dialog.Close(busydialognocancel)")
+
+
+def _clean_stale_pvr_db():
+    try:
+        import sqlite3
+        db_dir = xbmcvfs.translatePath("special://userdata/Database/")
+        if not os.path.exists(db_dir):
+            return
+        for f in os.listdir(db_dir):
+            if f.startswith("TV") and f.endswith(".db"):
+                db_path = os.path.join(db_dir, f)
+                try:
+                    conn = sqlite3.connect(db_path)
+                    cur = conn.cursor()
+                    cur.execute("SELECT idClient, iInstanceID FROM clients WHERE sAddonID='pvr.iptvsimple';")
+                    rows = cur.fetchall()
+                    if len(rows) > 1:
+                        inst1_client = [r[0] for r in rows if r[1] == 1]
+                        keep_client_id = inst1_client[0] if inst1_client else sorted(rows, key=lambda x: x[1])[0][0]
+                        stale_clients = [r[0] for r in rows if r[0] != keep_client_id]
+                        if stale_clients:
+                            placeholders = ",".join(["?"] * len(stale_clients))
+                            cur.execute(f"DELETE FROM map_channelgroups_channels WHERE idChannel IN (SELECT idChannel FROM channels WHERE iClientId IN ({placeholders}));", stale_clients)
+                            cur.execute(f"DELETE FROM channels WHERE iClientId IN ({placeholders});", stale_clients)
+                            cur.execute(f"DELETE FROM clients WHERE idClient IN ({placeholders});", stale_clients)
+                            Script.log(f"[PVR SETUP] Cleared stale PVR clients {stale_clients} from {f}", lvl=Script.INFO)
+                    
+                    # Sync Kodi internal channel numbers (iChannelNumber) with M3U channel numbers (iClientChannelNumber)
+                    cur.execute("UPDATE map_channelgroups_channels SET iChannelNumber = iClientChannelNumber WHERE iClientChannelNumber IS NOT NULL AND iClientChannelNumber > 0;")
+                    cur.execute("UPDATE map_channelgroups_channels SET iOrder = iClientChannelNumber WHERE iClientChannelNumber IS NOT NULL AND iClientChannelNumber > 0;")
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    Script.log(f"[PVR SETUP] Database cleanup error on {f}: {e}", lvl=Script.WARNING)
+    except Exception as e:
+        Script.log(f"[PVR SETUP] General DB cleanup error: {e}", lvl=Script.WARNING)
+
+
+def _setup(m3uPath, epgUrl):
+    pDialog = DialogProgress()
+    pDialog.create("PVR Setup in progress")
+    ADDON_ID = "pvr.iptvsimple"
+    addon = Addon(ADDON_ID)
+    ADDON_NAME = addon.getAddonInfo("name")
+    addon_path = xbmcvfs.translatePath(addon.getAddonInfo("profile"))
+
+    kodi_rpc("Addons.SetAddonEnabled", {"addonid": ADDON_ID, "enabled": False})
+    pDialog.update(10)
+
+    # Clean any duplicate stale clients from TV database
+    _clean_stale_pvr_db()
+
+    # newer PVR Simple uses instance settings that can't yet be set via python api
+    # so do a workaround where we leverage the migration when no instance settings found
+    if LooseVersion(addon.getAddonInfo("version")) >= LooseVersion("20.8.0"):
+        jiotv_instances = []
+        other_instances = []
+
+        if os.path.exists(addon_path):
+            for file in os.listdir(addon_path):
+                if file.startswith("instance-settings-") and file.endswith(".xml"):
+                    file_path = os.path.join(addon_path, file)
+                    try:
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            data = f.read()
+                        if (
+                            'id="m3uPath">{}</setting>'.format(m3uPath) in data
+                            or 'id="epgUrl">{}</setting>'.format(epgUrl) in data
+                            or "plugin.kodi.jiotv" in data
+                        ):
+                            jiotv_instances.append(file_path)
+                        else:
+                            other_instances.append(file_path)
+                    except Exception as e:
+                        Script.log(f"[PVR SETUP] Failed reading {file_path}: {e}", lvl=Script.WARNING)
+
+        # Ensure only ONE JioTV instance exists by removing any duplicates
+        target_instance = None
+        if jiotv_instances:
+            inst1_path = os.path.join(addon_path, "instance-settings-1.xml")
+            if inst1_path in jiotv_instances:
+                target_instance = inst1_path
+            else:
+                target_instance = jiotv_instances[0]
+
+            for inst_file in jiotv_instances:
+                if inst_file != target_instance:
+                    Script.log(f"[PVR SETUP] Deleting duplicate JioTV instance: {inst_file}", lvl=Script.INFO)
+                    try:
+                        os.remove(inst_file)
+                    except Exception:
+                        xbmcvfs.delete(inst_file)
+
+        if not target_instance:
+            inst1_path = os.path.join(addon_path, "instance-settings-1.xml")
+            if not os.path.exists(inst1_path) or inst1_path not in other_instances:
+                target_instance = inst1_path
+            else:
+                target_instance = os.path.join(addon_path, "instance-settings-91.xml")
+
+        if not os.path.exists(target_instance):
+            for other_file in other_instances:
+                bu_file = other_file + ".bu"
+                safe_copy(other_file, bu_file, del_src=True)
+
+            pDialog.update(25)
+            kodi_rpc("Addons.SetAddonEnabled", {"addonid": ADDON_ID, "enabled": True})
+            while not os.path.exists(os.path.join(addon_path, "instance-settings-1.xml")):
+                monitor.waitForAbort(1)
+            kodi_rpc("Addons.SetAddonEnabled", {"addonid": ADDON_ID, "enabled": False})
+            monitor.waitForAbort(1)
+
+            created_inst1 = os.path.join(addon_path, "instance-settings-1.xml")
+            if target_instance != created_inst1:
+                safe_copy(created_inst1, target_instance, del_src=True)
+
+            for file in os.listdir(addon_path):
+                if file.endswith(".bu"):
+                    safe_copy(
+                        os.path.join(addon_path, file),
+                        os.path.join(addon_path, file[:-3]),
+                        del_src=True,
+                    )
+
+        pDialog.update(40)
+        if os.path.exists(target_instance):
+            try:
+                with open(target_instance, "r", encoding="utf-8") as f:
+                    xml_content = f.read()
+
+                if "Migrated Add-on Config" in xml_content:
+                    xml_content = xml_content.replace("Migrated Add-on Config", ADDON_NAME)
+
+                def _update_setting_xml(data, setting_id, value):
+                    pattern = r'<setting id="' + re.escape(setting_id) + r'"[^>]*/?>([^<]*</setting>)?'
+                    replacement = f'<setting id="{setting_id}">{value}</setting>'
+                    if re.search(pattern, data):
+                        return re.sub(pattern, replacement, data)
+                    else:
+                        return data.replace('</settings>', f'    <setting id="{setting_id}">{value}</setting>\n</settings>')
+
+                xml_content = _update_setting_xml(xml_content, "m3uPathType", "0")
+                xml_content = _update_setting_xml(xml_content, "m3uPath", m3uPath)
+                xml_content = _update_setting_xml(xml_content, "epgPathType", "1")
+                xml_content = _update_setting_xml(xml_content, "epgUrl", epgUrl)
+                xml_content = _update_setting_xml(xml_content, "epgCache", "false")
+                xml_content = _update_setting_xml(xml_content, "useInputstreamAdaptiveforHls", "true")
+                xml_content = _update_setting_xml(xml_content, "catchupEnabled", "true")
+
+                with open(target_instance, "w", encoding="utf-8") as f:
+                    f.write(xml_content)
+            except Exception as e:
+                Script.log(f"[PVR SETUP] Error writing instance settings to {target_instance}: {e}", lvl=Script.WARNING)
+
+        pDialog.update(60)
+        kodi_rpc("Addons.SetAddonEnabled", {"addonid": ADDON_ID, "enabled": True})
+        pDialog.update(70)
+    else:
+        kodi_rpc("Addons.SetAddonEnabled", {"addonid": ADDON_ID, "enabled": True})
+        pDialog.update(70)
+
+    set_kodi_setting("epg.futuredaystodisplay", 7)
+    #  set_kodi_setting('epg.ignoredbforclient', True)
+    set_kodi_setting("pvrmanager.syncchannelgroups", True)
+    set_kodi_setting("pvrmanager.preselectplayingchannel", True)
+    set_kodi_setting("pvrmanager.backendchannelorder", True)
+    set_kodi_setting("pvrmanager.usebackendchannelnumbers", True)
+    
+    # Run DB cleanup again to ensure clean database state after enabling
+    _clean_stale_pvr_db()
+    
+    # Trigger PVR database reset so Kodi rebuilds iChannelNumber fresh from M3U tvg-chno
+    try:
+        kodi_rpc("Settings.SetSettingValue", {"setting": "pvrmanager.resetdb", "value": True})
+    except Exception as reset_err:
+        Script.log(f"[PVR SETUP] pvrmanager.resetdb trigger failed: {reset_err}", lvl=Script.INFO)
+    
+    pDialog.update(100)
+    pDialog.close()
+    Script.notify("IPTV setup", "Epg and playlist updated")
+
+    return True
+
+
+def parse_m3u(content):
+    channels = []
+    current_channel = {}
+    
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#EXTM3U"):
+            continue
+        if line.startswith("#EXTINF:"):
+            current_channel = {
+                "properties": {},
+                "headers": {}
+            }
+            comma_idx = line.rfind(",")
+            if comma_idx != -1:
+                current_channel["channel_name"] = line[comma_idx+1:].strip()
+                attrs_part = line[8:comma_idx].strip()
+            else:
+                current_channel["channel_name"] = "Unknown Channel"
+                attrs_part = line[8:].strip()
+                
+            attribs = re.findall(r'([\w\-]+)="([^"]*)"', attrs_part)
+            for k, v in attribs:
+                if k == "tvg-id":
+                    current_channel["channel_id"] = v
+                elif k == "tvg-logo":
+                    current_channel["logoUrl"] = v
+                elif k == "group-title":
+                    current_channel["group"] = v
+                elif k == "tvg-language":
+                    current_channel["language"] = v
+                else:
+                    current_channel[k] = v
+            if "channel_id" not in current_channel:
+                current_channel["channel_id"] = current_channel.get("tvg-name", current_channel["channel_name"])
+        elif line.startswith("#KODIPROP:"):
+            prop_part = line[10:].strip()
+            if "=" in prop_part:
+                k, v = prop_part.split("=", 1)
+                current_channel["properties"][k.strip()] = v.strip()
+        elif line.startswith("#"):
+            continue
+        else:
+            url_part = line
+            headers = {}
+            if "|" in url_part:
+                url_part, headers_part = url_part.split("|", 1)
+                from urllib.parse import parse_qsl
+                parsed_headers = parse_qsl(headers_part)
+                for kh, vh in parsed_headers:
+                    headers[kh] = vh
+            current_channel["stream_url"] = url_part
+            current_channel["headers"] = headers
+            channels.append(current_channel)
+            current_channel = {}
+            
+    return channels
+
+
+def parse_xml(content):
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(content)
+    channels = []
+    for chan_elem in root.findall(".//channel"):
+        channel = {
+            "channel_id": chan_elem.findtext("channel_id", ""),
+            "channel_name": chan_elem.findtext("channel_name", ""),
+            "logoUrl": chan_elem.findtext("logoUrl", ""),
+            "group": chan_elem.findtext("group", ""),
+            "language": chan_elem.findtext("language", ""),
+            "stream_url": chan_elem.findtext("stream_url", ""),
+            "properties": {},
+            "headers": {}
+        }
+        if not channel["channel_id"] and channel["channel_name"]:
+            channel["channel_id"] = channel["channel_name"]
+        
+        props_elem = chan_elem.find("properties")
+        if props_elem is not None:
+            for prop in props_elem.findall("property"):
+                name = prop.get("name")
+                if name:
+                    channel["properties"][name] = prop.text or ""
+                    
+        headers_elem = chan_elem.find("headers")
+        if headers_elem is not None:
+            for header in headers_elem.findall("header"):
+                name = header.get("name")
+                if name:
+                    channel["headers"][name] = header.text or ""
+                    
+        channels.append(channel)
+    return channels
+
+
+def getExtraChannels():
+    path = xbmcvfs.translatePath("special://profile/addon_data/plugin.kodi.jiotv/extra_channels.json")
+    if not os.path.exists(path):
+        try:
+            template_path = xbmcvfs.translatePath("special://home/addons/plugin.kodi.jiotv/resources/extra_channels_template.m3u")
+            if not os.path.exists(template_path):
+                template_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "extra_channels_template.m3u")
+            
+            if os.path.exists(template_path):
+                with open(template_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                channels = parse_m3u(content)
+                if channels:
+                    dest_dir = os.path.dirname(path)
+                    if not os.path.exists(dest_dir):
+                        os.makedirs(dest_dir)
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(channels, f, indent=4)
+                    return channels
+        except Exception as e:
+            Script.log(f"Auto-populating extra channels failed: {e}", lvl=Script.ERROR)
+            
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            Script.log(f"Failed to load extra channels: {e}", lvl=Script.ERROR)
+    return []
+
+
+def importExtraChannels():
+    dialog = Dialog()
+    src = dialog.browse(1, "Select Extra Channels File", "files", ".m3u|.m3u8|.json|.xml")
+    if src:
+        try:
+            if src.startswith("http"):
+                content = urlquick.get(src).content.decode("utf-8", errors="ignore")
+            else:
+                with open(src, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                    
+            channels = []
+            if src.lower().endswith(".json"):
+                channels = json.loads(content)
+            elif src.lower().endswith(".xml"):
+                channels = parse_xml(content)
+            else:
+                channels = parse_m3u(content)
+                
+            if not channels:
+                Script.notify("Import Failed", "No valid channels found.")
+                return
+                
+            dest_dir = xbmcvfs.translatePath("special://profile/addon_data/plugin.kodi.jiotv/")
+            if not os.path.exists(dest_dir):
+                os.makedirs(dest_dir)
+                
+            dest = os.path.join(dest_dir, "extra_channels.json")
+            with open(dest, "w", encoding="utf-8") as f:
+                json.dump(channels, f, indent=4)
+                
+            try:
+                from resources.lib.pvr import m3ugen
+                m3ugen(None, notify="no")
+            except Exception as e:
+                Script.log(f"PVR auto-refresh after import failed: {e}", lvl=Script.WARNING)
+                
+            dialog.ok("Import Success", "Successfully imported {0} channels.\n\nPlease restart Kodi application or reload the add-on to apply the changes completely.".format(len(channels)))
+            
+        except Exception as e:
+            Script.log(f"Failed to import extra channels: {e}", lvl=Script.ERROR)
+            Script.notify("Error", "Failed to import: {0}".format(str(e)[:50]))
+
+
+def exportExtraChannelsTemplate():
+    src = xbmcvfs.translatePath("special://home/addons/plugin.kodi.jiotv/resources/extra_channels_template.m3u")
+    if not os.path.exists(src):
+        src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "extra_channels_template.m3u")
+        
+    if not os.path.exists(src):
+        Script.notify("Error", "Template file not found.")
+        return
+        
+    dialog = Dialog()
+    dest_dir = dialog.browse(3, "Select folder to export template", "files")
+    if dest_dir:
+        # Construct path keeping Kodi VFS compatibility in mind
+        if not dest_dir.endswith('/') and not dest_dir.endswith('\\'):
+            dest_dir += '/'
+        dest = dest_dir + "extra_channels_template.m3u"
+        try:
+            if xbmcvfs.exists(dest):
+                xbmcvfs.delete(dest)
+            xbmcvfs.copy(src, dest)
+            Script.notify("Export Success", "Template exported successfully")
+        except Exception as e:
+            Script.log(f"Failed to export extra channels template: {e}", lvl=Script.ERROR)
+            Script.notify("Error", "Failed to export template")
+
+
+def viewReadmeDialog():
+    import xbmcgui
+    dialog = xbmcgui.Dialog()
+    options = [
+        "1. Readme (Installation & Expectations)",
+        "2. Addon Features & Integration Guide",
+        "3. Best Practices & Troubleshooting",
+        "4. Frequently Asked Questions (FAQ)"
+    ]
+    sel = dialog.select("Select Document to View", options)
+    if sel == 0:
+        show_file_in_textviewer("README.md")
+    elif sel == 1:
+        show_file_in_textviewer("mds/features.md")
+    elif sel == 2:
+        show_file_in_textviewer("mds/best_practices.md")
+    elif sel == 3:
+        show_file_in_textviewer("mds/FAQs.md")
+
+
+def clean_html_for_kodi(text):
+    import re
+    # Remove HTML comments
+    text = re.sub(r'<!--.*?-->', '', text, flags=re.DOTALL)
+    # Convert header tags to clean plain text format
+    text = re.sub(r'<h[1-6][^>]*>', '\n## ', text)
+    text = re.sub(r'</h[1-6]>', '\n', text)
+    # Convert br tags to newlines
+    text = re.sub(r'<br\s*/?>', '\n', text)
+    # Remove remaining HTML tags
+    text = re.sub(r'<[^>]+>', '', text)
+    # Clean up GitHub alerts formatting to be readable
+    text = re.sub(r'>\s*\[!(WARNING|IMPORTANT|CAUTION|NOTE|TIP)\]', r'* \1:', text)
+    # Remove excess blank lines
+    text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
+    return text.strip()
+
+
+def show_file_in_textviewer(relative_path):
+    import xbmcgui
+    import xbmcvfs
+    path = xbmcvfs.translatePath(f"special://home/addons/plugin.kodi.jiotv/{relative_path}")
+    if not os.path.exists(path):
+        # fallback
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), relative_path)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            cleaned_content = clean_html_for_kodi(content)
+            xbmcgui.Dialog().textviewer(os.path.basename(relative_path), cleaned_content)
+        except Exception as e:
+            Script.log(f"Failed to read doc {relative_path}: {e}", lvl=Script.ERROR)
+            Script.notify("Error", "Failed to load document")
+    else:
+        Script.notify("Error", "Document not found")
+
+
+def portFavouritesToPVR():
+    import re
+    import pickle
+    import xml.etree.ElementTree as ET
+    fav_file = xbmcvfs.translatePath("special://userdata/favourites.xml")
+    chan_ids = []
+    seen = set()
+    
+    def process_target(target_str):
+        if not target_str or "plugin.kodi.jiotv" not in target_str.lower():
+            return
+        cid = None
+        # Check direct channel_id parameter
+        m = re.search(r'channel_id=([0-9a-zA-Z_-]+)', target_str)
+        if m:
+            cid = str(m.group(1))
+        elif "_pickle_=" in target_str:
+            try:
+                pickle_hex = target_str.split("_pickle_=")[1]
+                for delimiter in ['"', "'", "&", ")", " ", "\\"]:
+                    if delimiter in pickle_hex:
+                        pickle_hex = pickle_hex.split(delimiter)[0]
+                data_bytes = bytes.fromhex(pickle_hex)
+                unpickled = pickle.loads(data_bytes)
+                if isinstance(unpickled, dict) and "channel_id" in unpickled:
+                    cid = str(unpickled["channel_id"])
+            except Exception as e:
+                Script.log(f"[FAV-PORT] Failed to decode _pickle_: {e}", lvl=Script.WARNING)
+
+        if cid and cid not in seen:
+            seen.add(cid)
+            chan_ids.append(cid)
+
+    # Method 1: JSON-RPC query
+    try:
+        json_cmd = '{"jsonrpc": "2.0", "method": "Favourites.GetFavourites", "params": {"properties": ["path"]}, "id": 1}'
+        res_str = xbmc.executeJSONRPC(json_cmd)
+        if res_str:
+            import json
+            res = json.loads(res_str)
+            favs = res.get("result", {}).get("favourites", [])
+            for f in favs:
+                path = f.get("path", "")
+                process_target(path)
+    except Exception as json_err:
+        Script.log(f"[FAV-PORT] JSON-RPC query failed: {json_err}", lvl=Script.WARNING)
+        
+    # Method 2: Parse favourites.xml directly
+    if os.path.exists(fav_file):
+        try:
+            tree = ET.parse(fav_file)
+            root = tree.getroot()
+            for fav in root.findall(".//favourite"):
+                fav_str = (fav.text or "") + " " + (fav.attrib.get("thumb", ""))
+                process_target(fav_str)
+        except Exception as xml_err:
+            Script.log(f"[FAV-PORT] XML parse failed: {xml_err}", lvl=Script.WARNING)
+            
+    # Override existing favourites in localdb preserving exact user order
+    with PersistentDict("localdb") as db:
+        db["pvr_favourites"] = chan_ids
+        
+    # Regenerate M3U playlist
+    try:
+        from resources.lib.pvr import m3ugen
+        m3ugen(None, notify="no")
+    except Exception as m3u_err:
+        Script.log(f"[FAV-PORT] Error updating M3U: {m3u_err}", lvl=Script.ERROR)
+        
+    import xbmcgui
+    if len(chan_ids) > 0:
+        msg = f"Successfully ported {len(chan_ids)} JioTV favourite channels to the TV Guide Favourites group in your exact order.\n\nPlease restart Kodi (or reload IPTV Simple Client) once for the Favourites group to reflect in the TV Guide."
+        xbmcgui.Dialog().ok("JioTV Favourites Ported", msg)
+        Script.notify("JioTV PVR", f"Ported {len(chan_ids)} favourites to TV Guide.")
+    else:
+        xbmcgui.Dialog().ok("JioTV Favourites Ported", "No JioTV favourites found in Kodi favourites.xml.")
+        Script.notify("JioTV PVR", "No JioTV favourites found to port.")
+
+
+

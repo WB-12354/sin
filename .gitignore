@@ -1,0 +1,121 @@
+# Ignore mds folder but allow user documentation
+mds/*
+!mds/features.md
+!mds/FAQs.md
+!mds/best_practices.md
+
+
+# Ignore test_scripts folder
+test_scripts/
+scratch/
+kodi.log
+*.log
+*.pickle
+*.webp
+*.zip
+*.zip.md5
+
+# Ignore .idea folder
+.idea/
+
+# Byte-compiled / optimized / DLL files
+*.py[cod]
+*$py.class
+
+# C extensions
+*.dll
+*.exe
+*.pyd
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project specific
+temp/
+tmp/
+
+# Test files (only root level, allow in test_scripts/)
+test_vod_timeline.py
+test_realistic_vod.py
+fixed_vod_analysis.py
+comprehensive_vod_test.py
+debug_channels.py
+test_specific_vod.py
+test_vod_endpoints.py
+simple_vod_test.py
+
+# Internal Agent Workflows
+.agents/
+.agent/
+_agents/
+_agent/
+/scratch/check_addons.xml
+/scratch/check_addons_v125.xml
+/scratch/dump_db.py
+/jiotv_proxy_implementation_plan.md
+/scratch/print_channels.py
+/scratch/read_db.py
+/scratch/search_channel_by_name.py
+/scratch/search_log.py
+/scratch/test_419_handling.py
+/scratch/test_addons.xml
+/scratch/test_expiry_setting.py
+/scratch/test_piped_url.py
+/scratch/test_refined_playback.py
+/scratch/test_segment_auth.py
+/scratch/test_sony_play.py
+/scratch/test_sony_playback_flow.py
+/scratch/test_two_cookies.py
+/scratch/test_zee_news.py
+/scratch/trigger_refresh.py

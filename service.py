@@ -1,0 +1,244 @@
+# -*- coding: utf-8 -*-
+
+import time
+import xbmcaddon
+
+# Wait for addon to be ready (prevents "Unknown addon id" errors during updates)
+_addon = None
+for i in range(20):
+    try:
+        _addon = xbmcaddon.Addon('plugin.kodi.jiotv')
+        break
+    except Exception:
+        time.sleep(1)
+
+import socket
+import threading
+from socketserver import ThreadingTCPServer
+
+from codequick import Script
+from codequick.script import Settings
+from kodi_six import xbmcgui
+from xbmc import Monitor, executebuiltin
+from xbmcaddon import Addon
+
+from resources.lib import proxy
+
+
+def serveForever(handler):
+    try:
+        handler.serve_forever()
+    except Exception as e:
+        Script.log(f"Service error: {e}", lvl=Script.ERROR)
+
+
+def find_available_port(start_port=48996, max_attempts=10):
+    """Find an available port starting from start_port"""
+    for port in range(start_port, start_port + max_attempts):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(('', port))
+            sock.close()
+            return port
+        except OSError:
+            continue
+    return start_port  # Fallback to original port
+
+
+# ─── JioTV Proxy (always running) ───────────────────────────────────────────
+
+_PORT = find_available_port()
+proxy.PROXY_PORT = _PORT
+Script.log(f"Starting JioTV proxy on port: {_PORT}", lvl=Script.INFO)
+
+try:
+    handler = ThreadingTCPServer(("", _PORT), proxy.JioTVProxy)
+    t = threading.Thread(target=serveForever, args=(handler,))
+    t.setDaemon(True)
+    t.start()
+    Script.log("JioTV proxy service started successfully", lvl=Script.INFO)
+except Exception as e:
+    Script.log(f"Failed to start JioTV proxy service: {e}", lvl=Script.ERROR)
+
+def _check_addon_update_and_m3u():
+    try:
+        from codequick.storage import PersistentDict
+        current_version = _addon.getAddonInfo("version") if _addon else ""
+        should_gen_m3u = Settings.get_boolean("m3ugen")
+        is_updated = False
+
+        with PersistentDict("localdb") as db:
+            last_version = db.get("_installed_addon_version", "")
+
+        if current_version and last_version != current_version:
+            Script.log(f"[UPDATE] Addon updated from '{last_version}' to '{current_version}'. Auto-updating playlist...", lvl=Script.INFO)
+            should_gen_m3u = True
+            is_updated = True
+            with PersistentDict("localdb") as db:
+                db["_installed_addon_version"] = current_version
+
+        if should_gen_m3u:
+            from resources.lib.pvr import m3ugen
+            m3ugen(None, notify="no")
+            Script.log("[UPDATE] Playlist generated successfully", lvl=Script.INFO)
+    except Exception as e:
+        Script.log(f"[UPDATE] Error during startup update check: {e}", lvl=Script.ERROR)
+
+_update_thread = threading.Thread(target=_check_addon_update_and_m3u)
+_update_thread.daemon = True
+_update_thread.start()
+
+# ─── Pre-warm TLS connections ────────────────────────────────────────────────
+# On Android TV via mobile hotspot, initial TLS handshakes can take 15+ seconds.
+# Pre-warming establishes the TLS session on startup so playback is fast.
+def _prewarm_tls():
+    try:
+        from resources.lib.utils import get_session
+        session = get_session()
+        session.head("https://jiotvapi.media.jio.com/", timeout=(15, 5))
+        Script.log("[PREWARM] TLS connection to jiotvapi.media.jio.com established", lvl=Script.INFO)
+    except Exception as e:
+        Script.log(f"[PREWARM] TLS pre-warm failed (non-critical): {e}", lvl=Script.INFO)
+
+_prewarm_thread = threading.Thread(target=_prewarm_tls)
+_prewarm_thread.daemon = True
+_prewarm_thread.start()
+
+# ─── Environment Network Patch ──────────────────────────────────────────────
+# Android Mobile Hotspots frequently broadcast broken IPv6 routes, causing
+# inputstream.adaptive (which uses Kodi's native Curl without Python's patches)
+# to constantly timeout and fail. We bypass this entirely by globally disabling
+# IPv6 inside Kodi's advancedsettings.xml file.
+def _apply_ipv6_hotspot_patch():
+    try:
+        import xml.etree.ElementTree as ET
+        import os
+        
+        # Use py3 / kodi v19+ translatePath correctly
+        try:
+            from xbmcvfs import translatePath
+        except ImportError:
+            from xbmc import translatePath
+            
+        adv_path = translatePath("special://masterprofile/advancedsettings.xml")
+        modified = False
+        
+        if os.path.exists(adv_path):
+            try:
+                tree = ET.parse(adv_path)
+                root = tree.getroot()
+            except Exception:
+                root = ET.Element("advancedsettings")
+                tree = ET.ElementTree(root)
+        else:
+            root = ET.Element("advancedsettings")
+            tree = ET.ElementTree(root)
+            
+        network = root.find("network")
+        if network is None:
+            network = ET.SubElement(root, "network")
+            
+        disableipv6 = network.find("disableipv6")
+        if disableipv6 is None:
+            disableipv6 = ET.SubElement(network, "disableipv6")
+            disableipv6.text = "true"
+            modified = True
+        elif disableipv6.text != "true":
+            disableipv6.text = "true"
+            modified = True
+            
+        if modified:
+            try:
+                tree.write(adv_path, encoding="utf-8", xml_declaration=True)
+                Script.log("[HOTSPOT PATCH] Successfully applied <disableipv6> to advancedsettings.xml.", lvl=Script.INFO)
+                Script.notify("JioTV Restart Required", "Hotspot Network Optimizer applied. Please RESTART Kodi.")
+            except Exception as e:
+                Script.log(f"[HOTSPOT PATCH] Failed to write advancedsettings.xml: {e}", lvl=Script.WARNING)
+    except Exception as e:
+        Script.log(f"[HOTSPOT PATCH] Critical error writing advancedsettings: {e}", lvl=Script.ERROR)
+
+# Run patch check async so it doesn't block startup
+_patch_thread = threading.Thread(target=_apply_ipv6_hotspot_patch)
+_patch_thread.daemon = True
+_patch_thread.start()
+
+# ─── Dev Tools Server (toggled via settings) ────────────────────────────────
+
+_dev_server_running = False
+
+
+def _check_dev_server():
+    """Start or stop dev server based on the devserver_enabled setting."""
+    global _dev_server_running
+    from resources.lib.constants import DEV_MODE
+
+    if not DEV_MODE:
+        return
+
+    try:
+        enabled = Addon().getSetting("devserver_enabled") == "true"
+    except Exception:
+        enabled = False
+
+    from resources.lib import devtools
+
+    if enabled and not devtools.is_running():
+        result = devtools.start_server()
+        if result:
+            ip, port = result
+            _dev_server_running = True
+            Script.log(f"[DEV] Dev server started at http://{ip}:{port}/", lvl=Script.INFO)
+
+    elif not enabled and devtools.is_running():
+        devtools.stop_server()
+        _dev_server_running = False
+        Script.log("[DEV] Dev server stopped", lvl=Script.INFO)
+
+
+# Check on startup
+_check_dev_server()
+
+
+# ─── Main Loop ──────────────────────────────────────────────────────────────
+
+class ServiceMonitor(Monitor):
+    def onSettingsChanged(self):
+        """Called by Kodi when any addon setting changes."""
+        _check_dev_server()
+
+
+monitor = ServiceMonitor()
+last_refresh_check = 0
+
+while not monitor.abortRequested():
+    # Run the background token refresh check every hour (3600 seconds)
+    current_time = time.time()
+    if current_time - last_refresh_check > 3600:
+        last_refresh_check = current_time
+        try:
+            from codequick.script import Settings
+            if Settings.get_boolean("bg_token_refresh"):
+                from codequick.storage import PersistentDict
+                with PersistentDict("localdb") as db:
+                    exp = db.get("exp", 0)
+                
+                # If the token is set to expire in less than 2 hours (7200 seconds), refresh it!
+                if exp > 0 and (exp - current_time) < 7200:
+                    Script.log("[BG_REFRESH] Token close to expiry. Refreshing in background...", lvl=Script.INFO)
+                    from resources.lib.utils import refresh_token, refresh_sso_token
+                    if refresh_token():
+                        # Also refresh the SSO token to maintain the main SSO session
+                        refresh_sso_token()
+        except Exception as e:
+            Script.log(f"[BG_REFRESH] Error checking/refreshing token in background: {e}", lvl=Script.WARNING)
+
+    if monitor.waitForAbort(1):
+        handler.shutdown()
+        handler.server_close()
+        # Also stop dev server on exit
+        try:
+            from resources.lib import devtools
+            devtools.stop_server()
+        except Exception:
+            pass
+        break

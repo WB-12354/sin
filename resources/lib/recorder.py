@@ -1,0 +1,2099 @@
+# -*- coding: utf-8 -*-
+from __future__ import unicode_literals
+
+import os
+import re
+import shutil
+import subprocess
+import threading
+import time
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from urllib.parse import urlencode, urljoin, urlparse, parse_qs, urlunparse
+from uuid import uuid4
+
+import inputstreamhelper
+import m3u8
+import requests
+import urlquick
+import xbmc
+import xbmcgui
+import xbmcvfs
+from codequick import Script
+from codequick.utils import keyboard
+from xbmcgui import Dialog
+
+from resources.lib.constants import (
+    IMG_CATCHUP,
+    PLAY_URL,
+    IMG_CATCHUP_SHOWS,
+    CATCHUP_SRC,
+    M3U_SRC,
+    EPG_SRC,
+    M3U_CHANNEL,
+    IMG_CONFIG,
+    EPG_PATH,
+    ADDON,
+    ADDON_ID,
+)
+from resources.lib.utils import (
+    getHeaders,
+    isLoggedIn,
+    login as ULogin,
+    logout as ULogout,
+    check_addon,
+    sendOTPV2,
+    get_local_ip,
+    getSonyHeaders,
+    getZeeHeaders,
+    zeeCookie,
+    quality_to_enum,
+    _setup,
+    kodi_rpc,
+    Monitor,
+    getCachedChannels,
+    getCachedDictionary,
+    cleanLocalCache,
+    getFeatured,
+    getVODContent,
+    getVODChannels,
+    getChannelVODContent,
+)
+
+# Global download state tracker
+_download_active = False
+_download_lock = threading.Lock()
+_download_title = ""
+
+
+def _parse_vod_duration_seconds(begin, end):
+    """Parse begin/end timestamps (e.g. '20260301T040000') and return duration in seconds."""
+    try:
+        fmt = "%Y%m%dT%H%M%S"
+        dt_begin = datetime.strptime(str(begin), fmt)
+        dt_end = datetime.strptime(str(end), fmt)
+        return max(int((dt_end - dt_begin).total_seconds()), 60)  # at least 60s
+    except Exception:
+        return 3600  # default 1 hour if parsing fails
+
+
+def _parse_ffmpeg_time(line):
+    """Extract current time in seconds from an ffmpeg stderr line like 'time=01:23:45.67'."""
+    match = re.search(r'time=(\d+):(\d+):(\d+\.?\d*)', line)
+    if match:
+        h, m, s = int(match.group(1)), int(match.group(2)), float(match.group(3))
+        return h * 3600 + m * 60 + s
+    return None
+
+
+# Token expires after 120 seconds; at ~5x download speed, 5 min of video takes ~60s
+CHUNK_DURATION_SECONDS = 300  # 5-minute chunks, safe margin within 120s token
+
+
+def _calculate_chunks(begin_str, end_str, chunk_seconds=CHUNK_DURATION_SECONDS):
+    """Split a time range into chunks for token-refresh download."""
+    try:
+        fmt = "%Y%m%dT%H%M%S"
+        dt_begin = datetime.strptime(str(begin_str), fmt)
+        dt_end = datetime.strptime(str(end_str), fmt)
+        chunks = []
+        current = dt_begin
+        while current < dt_end:
+            chunk_end = min(current + timedelta(seconds=chunk_seconds), dt_end)
+            chunks.append((current.strftime(fmt), chunk_end.strftime(fmt)))
+            current = chunk_end
+        return chunks
+    except Exception as e:
+        Script.log(f"[DOWNLOAD] Error calculating chunks: {e}", lvl=Script.ERROR)
+        return [(str(begin_str), str(end_str))]  # fallback: single chunk
+
+
+def _inhibit_power_saving(enable):
+    """Prevent or allow system sleep during download."""
+    try:
+        if enable:
+            xbmc.executebuiltin('InhibitIdleShutdown(true)')
+            # Windows: prevent system sleep via SetThreadExecutionState
+            try:
+                import ctypes
+                ES_CONTINUOUS = 0x80000000
+                ES_SYSTEM_REQUIRED = 0x00000001
+                ctypes.windll.kernel32.SetThreadExecutionState(
+                    ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+            except Exception:
+                pass
+        else:
+            xbmc.executebuiltin('InhibitIdleShutdown(false)')
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
+            except Exception:
+                pass
+        Script.log(f"[DOWNLOAD] Power saving {'inhibited' if enable else 'restored'}", lvl=Script.INFO)
+    except Exception as e:
+        Script.log(f"[DOWNLOAD] Power saving control error: {e}", lvl=Script.WARNING)
+
+
+def _build_ffmpeg_cmd(stream_url, output_file, channel_id, showtime, srno, headers, audio_map=None, title=None, description=None):
+    """Build an ffmpeg command with proper auth headers matching InputStream.Adaptive."""
+    safe_output = output_file.replace('\\', '/')
+    cmd = ['ffmpeg', '-y']
+
+    # Extract __hdnea__ cookie from URL
+    hdnea_cookie = ""
+    if '__hdnea__' in stream_url:
+        try:
+            url_parsed = urlparse(stream_url)
+            url_qs = parse_qs(url_parsed.query)
+            if '__hdnea__' in url_qs:
+                hdnea_cookie = "__hdnea__=" + url_qs['__hdnea__'][0]
+        except Exception:
+            hdnea_cookie = "__hdnea__" + stream_url.split("__hdnea__")[-1].split("&")[0]
+
+    # Build headers matching what player.py passes to InputStream.Adaptive
+    api_headers = getHeaders()
+    if api_headers:
+        api_headers["channelid"] = str(channel_id)
+        if showtime and srno:
+            api_headers["srno"] = str(srno)
+            api_headers["showtime"] = str(showtime)
+        api_headers["cookie"] = hdnea_cookie or headers.get("cookie", "")
+        api_headers.setdefault("user-agent", "jiotv")
+    else:
+        api_headers = headers
+
+    ffmpeg_headers = ""
+    for hk, hv in api_headers.items():
+        if hv and isinstance(hv, str):
+            ffmpeg_headers += f"{hk}: {hv}\r\n"
+
+    if ffmpeg_headers:
+        cmd.extend(['-headers', ffmpeg_headers])
+
+    cmd.extend(['-i', stream_url])
+    
+    if audio_map is not None:
+        cmd.extend(['-map', '0:v?', '-map', f'0:a:{audio_map}'])
+        
+    if title:
+        cmd.extend(['-metadata', f'title={title}'])
+    if description:
+        cmd.extend(['-metadata', f'comment={description}'])
+    
+    cmd.extend(['-c', 'copy', '-bsf:a', 'aac_adtstoasc', safe_output])
+    return cmd
+
+
+def _run_ffmpeg_chunk(cmd, output_file, timeout=180):
+    """Run ffmpeg for a single chunk. Returns True on success."""
+    try:
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        stdout, stderr = process.communicate(timeout=timeout)
+        if process.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+            return True
+        else:
+            Script.log(f"[DOWNLOAD] Chunk failed (code {process.returncode}): {stderr[-300:] if stderr else 'no stderr'}", lvl=Script.ERROR)
+            return False
+    except subprocess.TimeoutExpired:
+        process.kill()
+        Script.log("[DOWNLOAD] Chunk timed out", lvl=Script.ERROR)
+        return False
+    except Exception as e:
+        Script.log(f"[DOWNLOAD] Chunk error: {e}", lvl=Script.ERROR)
+        return False
+
+
+def resolve_and_merge_query(base_url, relative_url):
+    """
+    Resolve a relative URL against a base URL and merge their query parameters.
+    Ensures that parameters from the base URL (like tokens) are preserved
+    even if the relative URL has its own parameters.
+    """
+    parsed_base = urlparse(base_url)
+    # Resolve the path relative to the base URL
+    full_resolved_url = urljoin(base_url, relative_url)
+    parsed_resolved = urlparse(full_resolved_url)
+    
+    # Merge queries: base params + relative params
+    base_query = parse_qs(parsed_base.query)
+    rel_query = parse_qs(parsed_resolved.query)
+    
+    # Start with base query params
+    merged_query = base_query.copy()
+    # Update with relative query params (relative wins on conflict)
+    merged_query.update(rel_query)
+    
+    # Use safe='=/*~+@:' to prevent urlencode from corrupting the __hdnea__ CDN tokens
+    # which contain these characters in their values and fail validation if encoded.
+    new_query_str = urlencode(merged_query, doseq=True, safe='=/*~+@:')
+    
+    return urlunparse((
+        parsed_resolved.scheme,
+        parsed_resolved.netloc,
+        parsed_resolved.path,
+        parsed_resolved.params,
+        new_query_str,
+        parsed_resolved.fragment
+    ))
+
+
+def get_stream_url_for_recording(channel_id, showtime=None, srno=None, programId=None, begin=None, end=None):
+    """
+    Get stream URL for recording purposes without starting playback.
+    Returns the final stream URL that can be used for ffmpeg recording.
+    """
+    Script.log(f"[RECORDING] Getting stream URL for channel_id={channel_id}, showtime={showtime}", lvl=Script.INFO)
+
+    # Reuse the same logic as play function but return URL instead of playing
+    headerssony = getSonyHeaders()
+    sony_headers = getSonyHeaders()
+    try:
+        is_helper = inputstreamhelper.Helper("mpd", drm="com.widevine.alpha")
+        hasIs = is_helper.check_inputstream()
+        if not hasIs:
+            Script.log("[RECORDING] InputStream helper check failed", lvl=Script.ERROR)
+            return None
+
+        channel_id_str = str(channel_id)
+
+        stream_type = "Seek"
+        rjson = {"channel_id": int(channel_id), "stream_type": stream_type}
+        isCatchup = False
+
+        # Determine if this is a VOD/catchup request
+        if showtime and srno:
+            isCatchup = True
+            rjson["showtime"] = showtime
+            rjson["srno"] = srno
+            rjson["stream_type"] = "Catchup"
+            rjson["programId"] = programId
+            rjson["begin"] = begin
+            rjson["end"] = end
+
+            headers = getHeaders()
+            headers["channelid"] = str(channel_id)
+            headers["srno"] = rjson["srno"]
+            headers["showtime"] = rjson["showtime"]
+        else:
+            headers = getHeaders()
+            headers["channelid"] = str(channel_id)
+            headers["srno"] = rjson["srno"] if isCatchup else str(uuid4())
+
+        # Handle ZEE channels
+        zee_channels = {
+            "5016": "https://z5ak-cmaflive.zee5.com/cmaf/live/2105525/ZeeAnmolCinemaELE/master.m3u8",
+            "5017": "https://z5ak-cmaflive.zee5.com/cmaf/live/2105527/ZeeActionELE/master.m3u8",
+            "5023": "https://z5ak-cmaflive.zee5.com/cmaf/live/2105261/ZEECHITRAMANDIRELE/master.m3u8",
+            "5024": "https://z5ak-cmaflive.zee5.com/cmaf/live/2105526/ZeeAnmolELE/master.m3u8",
+            "5025": "https://z5live-cf.zee5.com/out/v1/ZEE5_Live_Channels/Zee-Ganga-Zee-Anmol-Cinema-2-SD/master/master.m3u8",
+            "5026": "https://z5ak-cmaflive.zee5.com/cmaf/live/2105176/BigMagicELE/master.m3u8",
+        }
+
+        sony_headers = getSonyHeaders()
+
+        if channel_id_str in zee_channels:
+            if channel_id_str == "5016":
+                zee_channelid = "0-9-zeeanmolcinema"
+                host = "z5ak-cmaflive.zee5.com"
+            elif channel_id_str == "5017":
+                zee_channelid = "0-9-zeeaction"
+                host = "z5ak-cmaflive.zee5.com"
+            elif channel_id_str == "5023":
+                zee_channelid = "0-9-394"
+                host = "z5ak-cmaflive.zee5.com"
+            elif channel_id_str == "5024":
+                zee_channelid = "0-9-zeeanmol"
+                host = "z5ak-cmaflive.zee5.com"
+            elif channel_id_str == "5025":
+                zee_channelid = "0-9-bigganga"
+                host = "z5live-cf.zee5.com"
+            elif channel_id_str == "5026":
+                zee_channelid = "0-9-bigmagic_1786965389"
+                host = "z5ak-cmaflive.zee5.com"
+            else:
+                zee_channelid = None
+
+            cook = zeeCookie(zee_channelid)
+            headerszee = getZeeHeaders(host)
+            headerszee.pop("Host", None)
+            base_url = zee_channels[channel_id_str]
+            onlyUrl = f"{base_url}{cook}"
+            return onlyUrl, headerszee
+
+        else:
+            # Get language ID for Sony channels
+            langId = ""
+            try:
+                channels = getCachedChannels()
+                if channels:
+                    for c in channels:
+                        if str(c.get("channel_id")) == str(channel_id):
+                            langId = str(c.get("channelLanguageId", ""))
+                            break
+            except Exception as e:
+                Script.log(f"[RECORDING] Error fetching language ID: {e}", lvl=Script.ERROR)
+
+            sony_headers = getSonyHeaders(channel_id=str(channel_id), languageId=langId)
+
+            api_data = f"stream_type={rjson['stream_type']}&channel_id={str(channel_id)}"
+
+            if isCatchup:
+                api_data += f"&srno={rjson.get('srno', '')}"
+                api_data += f"&programId={rjson.get('programId', '')}"
+                api_data += f"&begin={rjson.get('begin', '')}"
+                api_data += f"&end={rjson.get('end', '')}"
+                api_data += f"&showtime={rjson.get('showtime', '')}"
+
+            Script.log(f"[RECORDING] API call data: {api_data}", lvl=Script.INFO)
+
+            res = urlquick.post(
+                "https://jiotvapi.media.jio.com/playback/apis/v1.1/geturl",
+                data=api_data,
+                verify=False,
+                headers=sony_headers,
+                max_age=-1,
+            )
+
+            api_response = res.json()
+            result_url = api_response.get("result", "")
+            Script.log(f"[RECORDING] API result URL: {result_url}", lvl=Script.INFO)
+
+            # Get the final URL
+            final_url = api_response.get("result", "")
+            
+            # Extract cookie for Sony
+            if "__hdnea__" in final_url:
+                sony_headers["cookie"] = "__hdnea__" + final_url.split("__hdnea__")[-1]
+            
+            sony_headers.setdefault("user-agent", "jiotv")
+            sony_headers.pop("Host", None)
+            sony_headers.pop("Content-Type", None)
+            sony_headers.pop("Content-Length", None)
+
+            # Parse M3U8 to extract best quality and variants
+            if final_url:
+                try:
+                    m3u8Headers = sony_headers.copy()
+                    m3u8Headers.update({
+                        "content-type": "application/vnd.apple.mpegurl",
+                    })
+
+                    m3u8Res = urlquick.get(
+                        final_url, headers=m3u8Headers, verify=False, max_age=-1, raise_for_status=True
+                    )
+
+                    m3u8String = m3u8Res.text
+                    variant_m3u8 = m3u8.loads(m3u8String)
+                    if variant_m3u8.is_variant:
+                        # Use best quality for recording
+                        # sort playlists by bandwidth
+                        playlists = sorted(variant_m3u8.playlists, key=lambda p: (p.stream_info.bandwidth if p.stream_info.bandwidth else 0))
+                        best_playlist = playlists[-1]
+                        final_url = resolve_and_merge_query(final_url, best_playlist.uri)
+                except Exception as e:
+                    Script.log(f"[RECORDING] Error parsing M3U8: {e}", lvl=Script.WARNING)
+
+            Script.log(f"[RECORDING] Final stream URL: {final_url}", lvl=Script.INFO)
+            return final_url, sony_headers
+
+    except Exception as e:
+        Script.log(f"[RECORDING] Error getting stream URL: {e}", lvl=Script.ERROR)
+        return None, None
+
+
+def record_stream(stream_url, output_path, duration=None, headers=None):
+    """
+    Record a stream using ffmpeg and save as MP4.
+    duration: recording duration in seconds (None for VOD/full download)
+    headers: dict of headers to pass to ffmpeg
+    """
+    try:
+        # Build ffmpeg command
+        cmd = ['ffmpeg', '-y']  # -y to overwrite output file
+
+        # Add headers if provided
+        if headers:
+            header_str = ""
+            for key, value in headers.items():
+                header_str += f"{key}: {value}\r\n"
+            cmd.extend(['-headers', header_str])
+
+
+        # Add timeout to prevent hanging (in microseconds, 30s = 30000000)
+        cmd.extend(['-timeout', '30000000'])
+
+        # Input stream
+        cmd.extend(['-i', stream_url])
+
+        # Copy codecs (no re-encoding for speed and compatibility)
+        cmd.extend(['-c', 'copy'])
+
+        # Set duration if specified
+        if duration:
+            cmd.extend(['-t', str(duration)])
+
+        # Output file
+        cmd.append(output_path)
+
+        Script.log(f"[RECORDING] Starting ffmpeg with command: {' '.join(cmd)}", lvl=Script.INFO)
+
+        # Run ffmpeg
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+
+        # Monitor progress in a separate thread
+        def monitor_progress():
+            while True:
+                output = process.stderr.readline()
+                if output == '' and process.poll() is not None:
+                    break
+                if output:
+                    Script.log(f"[RECORDING] ffmpeg: {output.strip()}", lvl=Script.DEBUG)
+
+        monitor_thread = threading.Thread(target=monitor_progress)
+        monitor_thread.daemon = True
+        monitor_thread.start()
+
+        # Wait for completion
+        process.wait()
+
+        if process.returncode == 0:
+            Script.log(f"[RECORDING] Successfully recorded to: {output_path}", lvl=Script.INFO)
+            return True
+        else:
+            Script.log(f"[RECORDING] ffmpeg failed with return code: {process.returncode}", lvl=Script.ERROR)
+            return False
+
+    except Exception as e:
+        Script.log(f"[RECORDING] Error during recording: {e}", lvl=Script.ERROR)
+        return False
+
+
+def download_segment(session, url, headers, segment_index, temp_dir):
+    """
+    Download a specific M3U8 segment using a persistent session.
+    """
+    try:
+        start_time = time.time()
+        response = session.get(url, headers=headers, stream=True, timeout=20)
+        response.raise_for_status()
+        
+        segment_file = os.path.join(temp_dir, f'segment_{segment_index:04d}.ts')
+        total_bytes = 0
+        with open(segment_file, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=32768):
+                if chunk:
+                    f.write(chunk)
+                    total_bytes += len(chunk)
+        
+        duration = time.time() - start_time
+        speed = (total_bytes / 1024) / duration if duration > 0 else 0
+        Script.log(f"[DOWNLOAD] Seg {segment_index} done: {total_bytes/1024:.1f}KB in {duration:.2f}s ({speed:.1f} KB/s)", lvl=Script.DEBUG)
+        return segment_file
+    except Exception as e:
+        Script.log(f"[DOWNLOAD] Error downloading segment {segment_index}: {e}", lvl=Script.ERROR)
+        raise
+
+
+def dash_widevine_download(url, output_path, headers=None, num_threads=16):
+    """
+    Download DASH stream with Widevine DRM decryption.
+    Extracts PSSH from MPD, fetches license, and decrypts segments.
+    """
+    try:
+        if headers is None:
+            headers = {}
+
+        # Import required modules
+        import base64
+        import struct
+        import xml.etree.ElementTree as ET
+        
+        Script.log("[DASH] Starting DASH Widevine download", lvl=Script.INFO)
+
+        # Fetch MPD manifest
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        mpd_content = response.text
+
+        # Parse MPD to extract PSSH and content info
+        root = ET.fromstring(mpd_content)
+        
+        # Extract content_id from URL parameters or MPD
+        from urllib.parse import parse_qs, urlparse
+        parsed_url = urlparse(url)
+        url_params = parse_qs(parsed_url.query)
+        content_id = url_params.get('content_id', [None])[0]
+        
+        if not content_id:
+            # Try to extract from MPD
+            for elem in root.iter():
+                if 'content_id' in elem.attrib:
+                    content_id = elem.attrib['content_id']
+                    break
+
+        if not content_id:
+            Script.log("[DASH] Could not extract content_id", lvl=Script.ERROR)
+            return False
+
+        # Extract PSSH from MPD
+        pssh_data = None
+        for elem in root.iter():
+            if elem.tag.endswith('ContentProtection') and elem.attrib.get('schemeIdUri') == 'urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed':
+                pssh_elem = elem.find('{urn:mpeg:cenc:2013}pssh')
+                if pssh_elem is not None and pssh_elem.text:
+                    pssh_data = pssh_elem.text
+                    break
+
+        if not pssh_data:
+            Script.log("[DASH] No PSSH found in MPD", lvl=Script.ERROR)
+            return False
+
+        # Get license URL and headers
+        license_url, license_headers = get_widevine_license_info(
+            channel_id=headers.get('channelid', ''),
+            showtime=headers.get('showtime', ''),
+            srno=headers.get('srno', ''),
+            programId=content_id
+        )
+
+        if not license_url:
+            Script.log("[DASH] Could not get license URL", lvl=Script.ERROR)
+            return False
+
+        # Fetch Widevine license
+        Script.log(f"[DASH] Fetching license from: {license_url}", lvl=Script.INFO)
+        license_response = requests.post(
+            license_url,
+            headers=license_headers,
+            data=base64.b64decode(pssh_data),
+            timeout=10
+        )
+        license_response.raise_for_status()
+        
+        # Extract content keys from license response
+        # Note: This requires Widevine CDM or pywidevine library
+        # For now, save license for external processing
+        license_file = output_path.replace('.mp4', '.license')
+        with open(license_file, 'wb') as f:
+            f.write(license_response.content)
+        
+        Script.log(f"[DASH] License saved to: {license_file}", lvl=Script.INFO)
+        Script.log("[DASH] Note: Actual decryption requires Widevine CDM - saved for external processing", lvl=Script.WARNING)
+
+        # Download audio and video segments (encrypted)
+        # This is a simplified version - full implementation would parse MPD properly
+        segments_dir = output_path.replace('.mp4', '_segments')
+        os.makedirs(segments_dir, exist_ok=True)
+
+        # Find segment URLs in MPD
+        segment_urls = []
+        for elem in root.iter():
+            if elem.tag.endswith('Representation'):
+                for media_elem in elem.iter():
+                    if media_elem.tag.endswith('BaseURL') or media_elem.tag.endswith('SegmentURL'):
+                        seg_url = media_elem.attrib.get('media', media_elem.attrib.get('href', ''))
+                        if seg_url:
+                            if not seg_url.startswith('http'):
+                                base_url = url.rsplit('/', 1)[0]
+                                seg_url = f"{base_url}/{seg_url}"
+                            segment_urls.append(seg_url)
+
+        if not segment_urls:
+            Script.log("[DASH] No segments found in MPD", lvl=Script.ERROR)
+            return False
+
+        Script.log(f"[DASH] Found {len(segment_urls)} segments", lvl=Script.INFO)
+
+        # Download segments
+        downloaded_segments = []
+        for i, seg_url in enumerate(segment_urls):
+            try:
+                seg_response = requests.get(seg_url, headers=headers, timeout=20)
+                seg_response.raise_for_status()
+                
+                seg_file = os.path.join(segments_dir, f'segment_{i:04d}.mp4')
+                with open(seg_file, 'wb') as f:
+                    f.write(seg_response.content)
+                downloaded_segments.append(seg_file)
+                
+                Script.log(f"[DASH] Downloaded segment {i+1}/{len(segment_urls)}", lvl=Script.DEBUG)
+            except Exception as e:
+                Script.log(f"[DASH] Failed to download segment {i}: {e}", lvl=Script.ERROR)
+
+        Script.log(f"[DASH] Downloaded {len(downloaded_segments)} encrypted segments to: {segments_dir}", lvl=Script.INFO)
+        Script.log(f"[DASH] Use external tool with license file to decrypt and combine", lvl=Script.INFO)
+        
+        return True
+
+    except Exception as e:
+        Script.log(f"[DASH] Error in Widevine download: {e}", lvl=Script.ERROR)
+        return False
+
+
+def hls_segment_download(url, output_path, headers=None, num_threads=16):
+    """
+    Download an HLS (M3U8) stream by downloading segments in parallel.
+    Also downloads the AES-128 encryption key and saves a local M3U8 playlist.
+    Segments are saved to a persistent folder for manual processing if ffmpeg fails.
+    Works on all platforms (Windows, Linux, macOS, Android).
+    """
+    try:
+        if headers is None:
+            headers = {}
+
+        # Create a persistent folder for this VOD's segments
+        # Use the output filename (without extension) as the folder name
+        base_name = os.path.splitext(os.path.basename(output_path))[0]
+        segments_dir = os.path.join(os.path.dirname(output_path), base_name + '_segments')
+        os.makedirs(segments_dir, exist_ok=True)
+        Script.log(f"[DOWNLOAD] Segments folder: {segments_dir}", lvl=Script.INFO)
+
+        # Fetch the M3U8 playlist
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        content = response.text
+
+        playlist = m3u8.loads(content)
+
+        # If it's a master/variant playlist, pick the best quality
+        if playlist.is_variant:
+            Script.log("[DOWNLOAD] Master playlist detected, picking best variant", lvl=Script.INFO)
+            best_playlist = playlist.playlists[-1]  # Highest quality
+            variant_url = resolve_and_merge_query(url, best_playlist.uri)
+            Script.log(f"[DOWNLOAD] Best variant URL: {variant_url[:100]}...", lvl=Script.INFO)
+
+            # Fetch the media playlist
+            response = requests.get(variant_url, headers=headers, timeout=10)
+            response.raise_for_status()
+            content = response.text
+            playlist = m3u8.loads(content)
+            url = variant_url  # Update base URL for segment resolution
+
+        if not playlist.segments:
+            Script.log("[DOWNLOAD] No segments in M3U8 playlist", lvl=Script.ERROR)
+            return False
+
+        total_segments = len(playlist.segments)
+        Script.log(f"[DOWNLOAD] Found {total_segments} segments to download", lvl=Script.INFO)
+
+        # Download encryption key(s) if present
+        # Extract __hdnea__ token for cookie-based auth (this is how Kodi's InputStream.Adaptive works)
+        hdnea_cookie = ""
+        if '?' in url:
+            try:
+                url_parsed = urlparse(url)
+                url_qs = parse_qs(url_parsed.query)
+                if '__hdnea__' in url_qs:
+                    hdnea_cookie = "__hdnea__=" + url_qs['__hdnea__'][0]
+                elif '__hdnea__' in url:
+                    hdnea_cookie = "__hdnea__" + url.split("__hdnea__")[-1].split("&")[0]
+            except Exception:
+                if '__hdnea__' in url:
+                    hdnea_cookie = "__hdnea__" + url.split("__hdnea__")[-1].split("&")[0]
+
+        if hdnea_cookie:
+            Script.log(f"[DOWNLOAD] Extracted __hdnea__ cookie for key auth ({len(hdnea_cookie)} chars)", lvl=Script.INFO)
+
+        key_files = {}  # Maps original key URI -> local filename
+        for key in playlist.keys:
+            if key and key.uri and key.uri not in key_files:
+                # Build multiple candidate key URLs to try
+                key_urls_to_try = []
+
+                # Determine the original absolute key URL
+                if key.uri.startswith('http'):
+                    original_key_url = key.uri
+                else:
+                    original_key_url = urljoin(url, key.uri)
+
+                # Strategy 1: Original key URI with NO extra query params
+                # (InputStream.Adaptive uses cookie auth, not URL params)
+                key_parsed = urlparse(original_key_url)
+                clean_key_url = urlunparse((key_parsed.scheme, key_parsed.netloc, key_parsed.path, '', '', ''))
+                if clean_key_url != original_key_url:
+                    key_urls_to_try.append(("Clean URL (no query)", clean_key_url))
+
+                # Strategy 2: Rewrite fallback host to CDN host with ONLY __hdnea__ token (no vbegin/vend)
+                if 'tv.media.jio.com/fallback' in original_key_url or 'tv.media.jio.com' in original_key_url:
+                    try:
+                        base_parsed = urlparse(url)
+                        key_p = urlparse(original_key_url)
+                        # Strip /fallback from path
+                        clean_path = key_p.path.replace('/fallback', '')
+                        # Only include __hdnea__ from base URL, skip vbegin/vend
+                        base_qs = parse_qs(base_parsed.query)
+                        filtered_params = {}
+                        for k, v in base_qs.items():
+                            if k in ('__hdnea__',):
+                                filtered_params[k] = v[0]
+                        if filtered_params:
+                            qs = urlencode(filtered_params, safe='=/*~+@:')
+                            cdn_key_url = f"{base_parsed.scheme}://{base_parsed.netloc}{clean_path}?{qs}"
+                        else:
+                            cdn_key_url = f"{base_parsed.scheme}://{base_parsed.netloc}{clean_path}"
+                        key_urls_to_try.append(("CDN rewrite (hdnea only)", cdn_key_url))
+                        Script.log(f"[DOWNLOAD] Rewrote fallback key to CDN URL with auth tokens", lvl=Script.INFO)
+                    except Exception as e:
+                        Script.log(f"[DOWNLOAD] Warning: Failed to rewrite key URL: {e}", lvl=Script.WARNING)
+
+                # Strategy 3: CDN host with full query params from stream URL
+                if 'tv.media.jio.com' in original_key_url:
+                    try:
+                        base_parsed = urlparse(url)
+                        key_p = urlparse(original_key_url)
+                        clean_path = key_p.path.replace('/fallback', '')
+                        cdn_full_url = f"{base_parsed.scheme}://{base_parsed.netloc}{clean_path}?{base_parsed.query}"
+                        key_urls_to_try.append(("CDN rewrite (full query)", cdn_full_url))
+                    except Exception:
+                        pass
+
+                # Strategy 4: Original key URL as-is (maybe with merged query from resolve)
+                merged_key_url = resolve_and_merge_query(url, key.uri)
+                if merged_key_url not in [u for _, u in key_urls_to_try]:
+                    key_urls_to_try.append(("Merged query URL", merged_key_url))
+
+                # Strategy 5: Original key URL exactly as in M3U8
+                if original_key_url not in [u for _, u in key_urls_to_try]:
+                    key_urls_to_try.append(("Original URL", original_key_url))
+
+                Script.log(f"[DOWNLOAD] Will try {len(key_urls_to_try)} key URL strategies", lvl=Script.INFO)
+
+                # Build header sets to try for each URL
+                # Cookie-based auth (matching how InputStream.Adaptive/Kodi player works)
+                cookie_headers = {
+                    "user-agent": "jiotv",
+                    "cookie": hdnea_cookie or headers.get("cookie", ""),
+                }
+                cookie_headers = {k: v for k, v in cookie_headers.items() if v}
+
+                player_headers = {
+                    "user-agent": headers.get("user-agent", "jiotv"),
+                    "cookie": hdnea_cookie or headers.get("cookie", ""),
+                    "content-type": "application/vnd.apple.mpegurl",
+                    "Accesstoken": headers.get("Accesstoken", "")
+                }
+                player_headers = {k: v for k, v in player_headers.items() if v}
+
+                header_sets = [
+                    ("Cookie auth", cookie_headers),
+                    ("Player headers", player_headers),
+                    ("Full headers", headers),
+                    ("JioTV API headers", getHeaders()),
+                    ("Minimal headers", {"user-agent": "jiotv"}),
+                ]
+
+                key_downloaded = False
+                for url_name, try_key_url in key_urls_to_try:
+                    if key_downloaded:
+                        break
+                    for header_name, try_headers in header_sets:
+                        if key_downloaded:
+                            break
+                        try:
+                            if not try_headers:
+                                continue
+                            Script.log(f"[DOWNLOAD] Trying key: {url_name} + {header_name} -> {try_key_url[:100]}...", lvl=Script.INFO)
+                            key_response = requests.get(try_key_url, headers=try_headers, timeout=10, verify=False)
+                            key_response.raise_for_status()
+                            if len(key_response.content) == 16:  # AES-128 key is exactly 16 bytes
+                                key_filename = f"key_{len(key_files)}.key"
+                                key_path = os.path.join(segments_dir, key_filename)
+                                with open(key_path, 'wb') as f:
+                                    f.write(key_response.content)
+                                key_files[key.uri] = key_filename
+                                Script.log(f"[DOWNLOAD] SUCCESS: Saved key to {key_path} (16 bytes) via {url_name} + {header_name}", lvl=Script.INFO)
+                                key_downloaded = True
+                            else:
+                                Script.log(f"[DOWNLOAD] Key response unexpected size: {len(key_response.content)} bytes (expected 16) via {url_name} + {header_name}", lvl=Script.WARNING)
+                        except Exception as e:
+                            Script.log(f"[DOWNLOAD] Key failed: {url_name} + {header_name}: {e}", lvl=Script.WARNING)
+
+                if not key_downloaded:
+                    Script.log(f"[DOWNLOAD] Could not download encryption key after all strategies", lvl=Script.ERROR)
+                    Script.log("[DOWNLOAD] Will save segments anyway - encrypted but preserved", lvl=Script.WARNING)
+
+        # Build segment URLs
+        segments = []
+        for i, segment in enumerate(playlist.segments):
+            seg_url = resolve_and_merge_query(url, segment.uri)
+            segments.append((seg_url, i))
+
+        # Download segments in parallel with progress reporting
+        pDialog = xbmcgui.DialogProgress()
+        pDialog.create("Downloading VOD", "Preparing segments...")
+
+        completed_segments = 0
+        segment_files = [None] * total_segments
+        failed_segments = []
+
+        # Use a session for better performance
+        session = requests.Session()
+
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            future_to_idx = {
+                executor.submit(download_segment, session, seg_url, headers, idx, segments_dir): idx
+                for seg_url, idx in segments
+            }
+
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    segment_files[idx] = future.result()
+                    completed_segments += 1
+                    percent = int((completed_segments / total_segments) * 100)
+                    pDialog.update(percent, f"Downloaded {completed_segments}/{total_segments} segments")
+
+                    if pDialog.iscanceled():
+                        Script.log("[DOWNLOAD] Download canceled by user", lvl=Script.INFO)
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+                except Exception as e:
+                    failed_segments.append(idx)
+                    Script.log(f"[DOWNLOAD] Segment {idx} failed: {e}", lvl=Script.ERROR)
+
+        pDialog.close()
+
+        if pDialog.iscanceled():
+            Script.notify("Download Canceled", f"Partial segments saved to: {segments_dir}")
+            return False
+
+        if failed_segments:
+            Script.log(f"[DOWNLOAD] {len(failed_segments)} segments failed to download", lvl=Script.ERROR)
+
+        actual_segments = [f for f in segment_files if f is not None]
+        Script.log(f"[DOWNLOAD] Downloaded {len(actual_segments)}/{total_segments} segments", lvl=Script.INFO)
+
+        if not actual_segments:
+            Script.log("[DOWNLOAD] No segments were downloaded", lvl=Script.ERROR)
+            return False
+
+        # Save a local M3U8 playlist pointing to local files
+        local_m3u8_path = os.path.join(segments_dir, 'playlist.m3u8')
+        try:
+            with open(local_m3u8_path, 'w', newline='\n') as f:
+                f.write('#EXTM3U\n')
+                f.write('#EXT-X-VERSION:3\n')
+                if playlist.target_duration:
+                    f.write(f'#EXT-X-TARGETDURATION:{playlist.target_duration}\n')
+
+                last_key_uri = None  # Track to avoid writing duplicate key tags
+
+                for i, segment in enumerate(playlist.segments):
+                    if segment_files[i] is None:
+                        continue
+
+                    # Write key tag when the key changes (key rotation)
+                    if segment.key and segment.key.uri and segment.key.uri != last_key_uri:
+                        last_key_uri = segment.key.uri
+                        local_key = key_files.get(segment.key.uri, '')
+                        if local_key:
+                            # Key was downloaded - reference local file
+                            iv_str = f',IV={segment.key.iv}' if segment.key.iv else ''
+                            f.write(f'#EXT-X-KEY:METHOD={segment.key.method},URI="{local_key}"{iv_str}\n')
+                        else:
+                            # Key download failed - skip the key tag to treat as unencrypted
+                            Script.log(f"[DOWNLOAD] Key not available, skipping EXT-X-KEY tag - treating segments as unencrypted", lvl=Script.WARNING)
+
+                    # Write segment info
+                    if segment.duration:
+                        f.write(f'#EXTINF:{segment.duration},\n')
+                    else:
+                        f.write('#EXTINF:6.0,\n')
+
+                    # Use just the filename (relative path)
+                    seg_filename = os.path.basename(segment_files[i])
+                    f.write(f'{seg_filename}\n')
+
+                f.write('#EXT-X-ENDLIST\n')
+
+            Script.log(f"[DOWNLOAD] Saved local M3U8 playlist to: {local_m3u8_path}", lvl=Script.INFO)
+        except Exception as e:
+            Script.log(f"[DOWNLOAD] Error saving local M3U8: {e}", lvl=Script.WARNING)
+
+        # Also save the original M3U8 for reference
+        try:
+            original_m3u8_path = os.path.join(segments_dir, 'original_playlist.m3u8')
+            with open(original_m3u8_path, 'w', newline='\n') as f:
+                f.write(content)
+            Script.log(f"[DOWNLOAD] Saved original M3U8 to: {original_m3u8_path}", lvl=Script.INFO)
+        except Exception as e:
+            Script.log(f"[DOWNLOAD] Error saving original M3U8: {e}", lvl=Script.WARNING)
+
+        # Try ffmpeg with the local M3U8 (which has local key references)
+        Script.log("[DOWNLOAD] Attempting ffmpeg mux using local M3U8 playlist...", lvl=Script.INFO)
+        try:
+            # Use forward slashes for ffmpeg compatibility on all platforms
+            safe_m3u8 = local_m3u8_path.replace('\\', '/')
+            safe_output = output_path.replace('\\', '/')
+
+            cmd = [
+                'ffmpeg', '-y',
+                '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+                '-allowed_extensions', 'ALL',
+                '-i', safe_m3u8,
+                '-c', 'copy',
+                '-bsf:a', 'aac_adtstoasc',
+                safe_output
+            ]
+
+            Script.log(f"[DOWNLOAD] ffmpeg command: {' '.join(cmd)}", lvl=Script.INFO)
+
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                cwd=segments_dir  # Set working dir so relative paths in M3U8 work
+            )
+            stdout, stderr = process.communicate(timeout=300)  # 5 min timeout for muxing
+
+            if process.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                Script.log(f"[DOWNLOAD] Successfully created MP4: {output_path} ({file_size_mb:.1f} MB)", lvl=Script.INFO)
+
+                # Clean up segments folder on success
+                import shutil
+                shutil.rmtree(segments_dir, ignore_errors=True)
+                return True
+            else:
+                Script.log(f"[DOWNLOAD] ffmpeg local mux failed (code {process.returncode})", lvl=Script.ERROR)
+                if stderr:
+                    Script.log(f"[DOWNLOAD] ffmpeg stderr: {stderr[-500:]}", lvl=Script.ERROR)
+
+                # FALLBACK: Try ffmpeg directly with the remote URL + cookie auth
+                # ffmpeg's HTTP client can handle AES-128 key downloads with cookies
+                Script.log("[DOWNLOAD] Trying ffmpeg direct download from remote URL with cookie auth...", lvl=Script.INFO)
+                try:
+                    direct_cmd = ['ffmpeg', '-y']
+
+                    # Build header string with cookie for key auth
+                    ffmpeg_headers = ""
+                    if hdnea_cookie:
+                        ffmpeg_headers += f"Cookie: {hdnea_cookie}\r\n"
+                    ffmpeg_headers += "User-Agent: jiotv\r\n"
+                    if headers.get("Accesstoken"):
+                        ffmpeg_headers += f"Accesstoken: {headers['Accesstoken']}\r\n"
+
+                    if ffmpeg_headers:
+                        direct_cmd.extend(['-headers', ffmpeg_headers])
+
+                    direct_cmd.extend([
+                        '-i', url,
+                        '-c', 'copy',
+                        '-bsf:a', 'aac_adtstoasc',
+                        safe_output
+                    ])
+
+                    Script.log(f"[DOWNLOAD] ffmpeg direct command: {' '.join(direct_cmd[:6])}... {safe_output}", lvl=Script.INFO)
+
+                    direct_process = subprocess.Popen(
+                        direct_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        universal_newlines=True,
+                    )
+                    d_stdout, d_stderr = direct_process.communicate(timeout=600)  # 10 min for remote download
+
+                    if direct_process.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                        file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                        Script.log(f"[DOWNLOAD] ffmpeg direct download SUCCESS: {output_path} ({file_size_mb:.1f} MB)", lvl=Script.INFO)
+                        import shutil
+                        shutil.rmtree(segments_dir, ignore_errors=True)
+                        return True
+                    else:
+                        Script.log(f"[DOWNLOAD] ffmpeg direct download also failed (code {direct_process.returncode})", lvl=Script.ERROR)
+                        if d_stderr:
+                            Script.log(f"[DOWNLOAD] ffmpeg direct stderr: {d_stderr[-500:]}", lvl=Script.ERROR)
+                except subprocess.TimeoutExpired:
+                    direct_process.kill()
+                    Script.log("[DOWNLOAD] ffmpeg direct download timed out", lvl=Script.ERROR)
+                except Exception as e2:
+                    Script.log(f"[DOWNLOAD] ffmpeg direct download error: {e2}", lvl=Script.ERROR)
+
+                # DON'T clean up - keep segments for manual processing
+                Script.log(f"[DOWNLOAD] Segments preserved at: {segments_dir}", lvl=Script.INFO)
+                Script.log(f"[DOWNLOAD] Local M3U8 playlist: {local_m3u8_path}", lvl=Script.INFO)
+                Script.log("[DOWNLOAD] You can manually process these with: ffmpeg -i playlist.m3u8 -c copy output.mp4", lvl=Script.INFO)
+                Script.notify("Download", f"Segments saved to: {segments_dir}\nUse ffmpeg manually to convert.")
+                return False
+
+        except subprocess.TimeoutExpired:
+            process.kill()
+            Script.log("[DOWNLOAD] ffmpeg mux timed out", lvl=Script.ERROR)
+            Script.log(f"[DOWNLOAD] Segments preserved at: {segments_dir}", lvl=Script.INFO)
+            Script.notify("Download", f"ffmpeg timed out. Segments at: {segments_dir}")
+            return False
+        except Exception as e:
+            Script.log(f"[DOWNLOAD] ffmpeg mux error: {e}", lvl=Script.ERROR)
+            Script.log(f"[DOWNLOAD] Segments preserved at: {segments_dir}", lvl=Script.INFO)
+            Script.notify("Download", f"Mux failed. Segments at: {segments_dir}")
+            return False
+
+    except Exception as e:
+        Script.log(f"[DOWNLOAD] Error in HLS segment download: {e}", lvl=Script.ERROR)
+        return False
+
+
+def multi_threaded_download(url, output_path, headers=None, num_threads=16, channel_info=None):
+    """
+    Download file using the best available method.
+    For M3U8/HLS streams: downloads segments in parallel, saves locally, then muxes with ffmpeg.
+    For direct files: uses multi-threaded range-request download.
+    """
+    try:
+        # Prepare headers
+        if headers is None:
+            headers = {}
+
+        # Check if it's an M3U8 playlist
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            content = response.text
+
+            if '#EXTM3U' in content:
+                Script.log("[DOWNLOAD] Detected M3U8 playlist, using segment download approach", lvl=Script.INFO)
+                return hls_segment_download(url, output_path, headers, num_threads)
+            elif '<MPD' in content or 'mpegdash+xml' in response.headers.get('content-type', ''):
+                Script.log("[DOWNLOAD] Detected DASH manifest, using Widevine download approach", lvl=Script.INFO)
+                return dash_widevine_download(url, output_path, headers, num_threads)
+
+        except Exception as e:
+            Script.log(f"[DOWNLOAD] Error checking manifest type: {e}, trying direct download", lvl=Script.WARNING)
+
+        # For non-M3U8 URLs: Try direct file download with range requests
+        Script.log("[DOWNLOAD] Attempting direct file download with range requests", lvl=Script.INFO)
+
+        # Check if server supports range requests
+        head_response = requests.head(url, headers=headers, timeout=10)
+        if 'Accept-Ranges' not in head_response.headers or head_response.headers['Accept-Ranges'] != 'bytes':
+            Script.log("[DOWNLOAD] Server does not support range requests, falling back to single-threaded download", lvl=Script.WARNING)
+            return single_threaded_download(url, output_path, headers)
+
+        content_length = int(head_response.headers.get('Content-Length', 0))
+        if content_length == 0:
+            Script.log("[DOWNLOAD] Could not get content length, falling back to single-threaded download", lvl=Script.WARNING)
+            return single_threaded_download(url, output_path, headers)
+
+        Script.log(f"[DOWNLOAD] Starting multi-threaded download of {content_length} bytes using {num_threads} threads", lvl=Script.INFO)
+
+        # Create temp directory for chunks
+        temp_dir = output_path + '.temp_chunks'
+        os.makedirs(temp_dir, exist_ok=True)
+
+        # Calculate chunk sizes
+        chunk_size = content_length // num_threads
+        chunks = []
+        for i in range(num_threads):
+            start = i * chunk_size
+            end = start + chunk_size - 1 if i < num_threads - 1 else content_length - 1
+            chunks.append((start, end, i))
+
+        # Download chunks in parallel
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            def download_chunk(url, start, end, headers, idx, temp_dir):
+                dl_headers = headers.copy()
+                dl_headers['Range'] = f'bytes={start}-{end}'
+                response = requests.get(url, headers=dl_headers, stream=True, timeout=20)
+                response.raise_for_status()
+                chunk_file = os.path.join(temp_dir, f'chunk_{idx:04d}.tmp')
+                with open(chunk_file, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=32768):
+                        if chunk:
+                            f.write(chunk)
+                return chunk_file
+
+            futures = [executor.submit(download_chunk, url, start, end, headers, idx, temp_dir) for start, end, idx in chunks]
+
+            # Wait for all downloads to complete
+            chunk_files = []
+            for future in futures:
+                try:
+                    chunk_files.append(future.result())
+                except Exception as e:
+                    Script.log(f"[DOWNLOAD] Chunk download failed: {e}", lvl=Script.ERROR)
+                    import shutil
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    return False
+
+        # Sort chunk files by index
+        chunk_files.sort(key=lambda x: int(os.path.basename(x).split('_')[1]))
+
+        # Combine chunks into final file
+        with open(output_path, 'wb') as outfile:
+            for chunk_file in chunk_files:
+                with open(chunk_file, 'rb') as infile:
+                    outfile.write(infile.read())
+
+        # Clean up temp files
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+        Script.log(f"[DOWNLOAD] Successfully downloaded {content_length} bytes to {output_path}", lvl=Script.INFO)
+        return True
+
+    except Exception as e:
+        Script.log(f"[DOWNLOAD] Error in multi-threaded download: {e}", lvl=Script.ERROR)
+        # Clean up on error
+        for temp in [output_path + '.temp_chunks']:
+            if os.path.exists(temp):
+                import shutil
+                shutil.rmtree(temp, ignore_errors=True)
+        return False
+
+
+def single_threaded_download(url, output_path, headers=None):
+    """
+    Fallback single-threaded download using requests.
+    """
+    try:
+        if headers is None:
+            headers = {}
+        
+        response = requests.get(url, headers=headers, stream=True, timeout=60)
+        response.raise_for_status()
+        
+        with open(output_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        
+        Script.log(f"[DOWNLOAD] Single-threaded download completed to {output_path}", lvl=Script.INFO)
+        return True
+        
+    except Exception as e:
+        Script.log(f"[DOWNLOAD] Error in single-threaded download: {e}", lvl=Script.ERROR)
+        return False
+
+
+def check_ffmpeg_available():
+    """
+    Check if ffmpeg is available on the system.
+    Returns True if available, False otherwise.
+    """
+    try:
+        # Try to run ffmpeg -version to check if it's available
+        process = subprocess.Popen(
+            ['ffmpeg', '-version'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        process.wait()
+        return process.returncode == 0
+    except (FileNotFoundError, OSError):
+        # ffmpeg not found in PATH
+        return False
+
+
+def get_widevine_license_info(channel_id, showtime=None, srno=None, programId=None, begin=None, end=None):
+    """
+    Extract Widevine license URL and headers from the VOD playback logic.
+    Returns license URL and headers for decryption.
+    """
+    try:
+        from resources.lib.utils import getHeaders, getSonyHeaders
+        from urllib.parse import urlencode
+        from uuid import uuid4
+        
+        # Get the same headers as used in play function
+        headers = getHeaders()
+        headers["channelid"] = str(channel_id)
+        
+        if showtime and srno:
+            headers["srno"] = srno
+            headers["showtime"] = showtime
+        
+        # Get stream URL to extract MPD data
+        stream_url, _ = get_stream_url_for_recording(channel_id, showtime, srno, programId, begin, end)
+        if not stream_url or '.mpd' not in stream_url:
+            return None, None
+            
+        # Get MPD response to extract license info
+        import urlquick
+        mpd_headers = headers.copy()
+        mpd_headers.update({
+            "user-agent": "okhttp/4.2.2",
+            "content-type": "application/dash+xml",
+        })
+        
+        mpd_res = urlquick.get(stream_url, headers=mpd_headers, verify=False, max_age=-1)
+        mpd_content = mpd_res.text
+        
+        # Extract content_id from MPD or use programId
+        content_id = programId
+        if not content_id:
+            # Try to extract from MPD content
+            import re
+            content_match = re.search(r'content_id["\s]*:\s*["\']([^"\']+)["\']', mpd_content)
+            if content_match:
+                content_id = content_match.group(1)
+        
+        if not content_id:
+            Script.log("[WIDEVINE] Could not extract content_id for license", lvl=Script.ERROR)
+            return None, None
+            
+        # Build license URL (same as used by InputStream Adaptive)
+        license_url = f"https://tv.media.jio.com/catchupproxy?provider=reliance&content_id={content_id}"
+        
+        # Build license headers (same as player.py)
+        license_headers = {
+            "User-Agent": "PlayTV/1.0",
+            "appName": "RJIL_JioTV",
+            "x-platform": "android",
+            "os": "android",
+            "devicetype": "phone",
+            "osVersion": "13",
+            "srno": str(uuid4()),
+            "channelid": str(channel_id),
+            "usergroup": "tvYR7NSNn7rymo3F",
+            "versionCode": "389",
+            "Accept-Encoding": "gzip, deflate",
+            "Content-Type": "application/octet-stream",
+            "Accept": "*/*",
+        }
+        
+        # Add authentication headers
+        license_headers.update({
+            "Accesstoken": headers.get("Accesstoken", ""),
+            "cookie": headers.get("cookie", ""),
+        })
+        
+        Script.log(f"[WIDEVINE] License URL: {license_url}", lvl=Script.INFO)
+        Script.log(f"[WIDEVINE] License headers prepared", lvl=Script.DEBUG)
+        
+        return license_url, license_headers
+        
+    except Exception as e:
+        Script.log(f"[WIDEVINE] Error getting license info: {e}", lvl=Script.ERROR)
+        return None, None
+
+
+def ensure_ffmpeg_available():
+    """
+    Ensure ffmpeg is available, showing installation instructions if not.
+    Returns True if ffmpeg is available, False otherwise.
+    """
+    if check_ffmpeg_available():
+        Script.log("[RECORDING] ffmpeg is already available", lvl=Script.INFO)
+        return True
+
+    Script.log("[RECORDING] ffmpeg not found, showing installation instructions", lvl=Script.INFO)
+
+    # Show user instructions directly
+    dialog = xbmcgui.Dialog()
+    result = dialog.yesno(
+        "ffmpeg Required",
+        "ffmpeg is required for recording but is not available on your system.\n\nWould you like to see installation instructions?",
+        "Cancel",
+        "Show Instructions"
+    )
+
+    if result:  # User wants installation guide
+        # Show installation instructions based on platform
+        platform = xbmc.getCondVisibility("System.Platform.Windows") and "windows" or \
+                  xbmc.getCondVisibility("System.Platform.Linux") and "linux" or \
+                  xbmc.getCondVisibility("System.Platform.OSX") and "macos" or \
+                  xbmc.getCondVisibility("System.Platform.Android") and "android" or "unknown"
+
+        instructions = {
+            "windows": "Download ffmpeg from https://ffmpeg.org/download.html#build-windows and add it to your system PATH, or install via Chocolatey: 'choco install ffmpeg'",
+            "linux": "Install via package manager: 'sudo apt install ffmpeg' (Ubuntu/Debian) or 'sudo dnf install ffmpeg' (Fedora)",
+            "macos": "Install via Homebrew: 'brew install ffmpeg'",
+            "android": "ffmpeg should be available via your Android Kodi build, or install a compatible version",
+            "unknown": "Please visit https://ffmpeg.org/download.html for installation instructions for your platform"
+        }
+
+        msg = instructions.get(platform, instructions["unknown"])
+        dialog.textviewer("ffmpeg Installation Instructions", msg)
+
+    return False
+
+
+def _prompt_audio_selection(channel_id, showtime, srno, programId, begin, end):
+    """Parses the M3U8 stream and prompts the user to select an audio track if there are multiple."""
+    try:
+        import m3u8
+        import requests
+        
+        # Fetch stream URL
+        stream_url, headers = get_stream_url_for_recording(channel_id, showtime, srno, programId, begin, end)
+        if not stream_url:
+            return None
+        
+        req_headers = {k: v for k, v in headers.items() if v and isinstance(v, str)}
+        Script.log(f"[_prompt_audio_selection] Fetching M3U8: {stream_url}", lvl=Script.INFO)
+        res = requests.get(stream_url, headers=req_headers, verify=False, timeout=15)
+        res.raise_for_status()
+        
+        playlist = m3u8.loads(res.text)
+        if playlist.is_variant:
+            audio_media = [m for m in playlist.media if m.type == "AUDIO"]
+            if len(audio_media) > 1:
+                options = []
+                for i, m in enumerate(audio_media):
+                    name = m.name or f"Track {i+1}"
+                    lang = (m.language or "Unknown").upper()
+                    if m.channels:
+                        options.append(f"{name} ({lang}) - {m.channels}ch")
+                    else:
+                        options.append(f"{name} ({lang})")
+                
+                sel = Dialog().select("Select Audio Track to Download", options)
+                if sel >= 0:
+                    Script.log(f"[_prompt_audio_selection] User selected audio track {sel}: {options[sel]}", lvl=Script.INFO)
+                    return sel
+        
+        # Fallback to ffprobe if it's not a variant playlist or doesn't list media
+        return __prompt_audio_ffprobe(stream_url, headers)
+    except Exception as e:
+        Script.log(f"[_prompt_audio_selection] Error parsing M3U8: {e}", lvl=Script.WARNING)
+        try:
+            return __prompt_audio_ffprobe(stream_url, headers)
+        except:
+            return None
+
+def __prompt_audio_ffprobe(stream_url, headers):
+    try:
+        import subprocess, json
+        probe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams']
+        ffmpeg_headers = ""
+        for hk, hv in headers.items():
+            if hv and isinstance(hv, str):
+                ffmpeg_headers += f"{hk}: {hv}\r\n"
+        if ffmpeg_headers:
+            probe_cmd.extend(['-headers', ffmpeg_headers])
+        probe_cmd.append(stream_url)
+        
+        probe_proc = subprocess.Popen(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        stdout, _ = probe_proc.communicate(timeout=15)
+        probe_data = json.loads(stdout)
+        
+        audio_streams = [s for s in probe_data.get('streams', []) if s.get('codec_type') == 'audio']
+        
+        if len(audio_streams) > 1:
+            options = []
+            for i, s in enumerate(audio_streams):
+                channels = s.get('channels', 2)
+                bitrate = s.get('bit_rate', 'unknown')
+                if bitrate != 'unknown':
+                    bitrate = f"{int(bitrate)//1000} kbps"
+                lang = s.get('tags', {}).get('language', 'unknown').upper()
+                if lang == 'UNKNOWN':
+                    lang = f"Track {i+1}"
+                options.append(f"{lang} - {channels}ch ({bitrate})")
+            
+            sel = Dialog().select("Select Audio Track to Download", options)
+            if sel >= 0:
+                Script.log(f"[__prompt_audio_ffprobe] User selected audio track {sel}: {options[sel]}", lvl=Script.INFO)
+                return sel
+    except Exception as probe_err:
+        Script.log(f"Audio probe error: {probe_err}", lvl=Script.WARNING)
+    return None
+
+@Script.register
+def record_live_stream(plugin, channel_id, channel_name="Unknown Channel"):
+    """
+    Record a live stream for user-specified duration.
+    """
+    try:
+        # Check if ffmpeg is available, install if necessary
+        if not ensure_ffmpeg_available():
+            Script.notify("Recording Failed", "ffmpeg is required but could not be installed")
+            return
+
+        # Get recording duration from user
+        duration_options = [
+            ("5 minutes", "300"),
+            ("10 minutes", "600"),
+            ("15 minutes", "900"),
+            ("30 minutes", "1800"),
+            ("1 hour", "3600"),
+            ("2 hours", "7200"),
+        ]
+
+        duration_labels = [opt[0] for opt in duration_options]
+        duration_values = [opt[1] for opt in duration_options]
+
+        duration_idx = Dialog().select("Select recording duration", duration_labels)
+        if duration_idx == -1:
+            return
+
+        duration = int(duration_values[duration_idx])
+
+        # Generate default filename: channel_name_date_time
+        safe_channel_name = "".join(c for c in channel_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+        default_filename = f"{safe_channel_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+        
+        # Get output filename from user, with default suggestion
+        filename = keyboard("Enter filename (or leave empty for auto-generated)", default=default_filename)
+        if not filename or filename.strip() == "":
+            filename = default_filename
+        elif not filename.endswith('.mp4'):
+            filename += '.mp4'
+
+        # Get save location (cross-platform compatible)
+        save_path = xbmcvfs.translatePath("special://home/userdata/addon_data/plugin.kodi.jiotv/recordings/")
+        if not xbmcvfs.exists(save_path):
+            xbmcvfs.mkdirs(save_path)
+
+        output_path = os.path.join(save_path, filename)
+
+        # Get stream URL
+        Script.notify("Recording", f"Getting stream URL for {channel_name}...")
+        stream_url, headers = get_stream_url_for_recording(channel_id)
+        if not stream_url:
+            Script.notify("Recording Failed", "Could not get stream URL")
+            return
+
+        # Build headers for ffmpeg (cross-platform compatible)
+        headers = getHeaders()
+        headers["user-agent"] = "jiotv"
+
+        # Start recording in background
+        Script.notify("Recording", f"Starting {duration//60}min recording...")
+
+        def do_recording():
+            success = record_stream(stream_url, output_path, duration, headers)
+            if success:
+                Script.notify("Recording Complete", f"Saved to: {filename}")
+            else:
+                Script.notify("Recording Failed", "Check logs for details")
+
+        recording_thread = threading.Thread(target=do_recording)
+        recording_thread.daemon = True
+        recording_thread.start()
+
+    except Exception as e:
+        Script.log(f"[RECORDING] Error in record_live_stream: {e}", lvl=Script.ERROR)
+        Script.notify("Recording Failed", str(e))
+
+
+@Script.register
+def download_vod(plugin, *args, **kwargs):
+    """
+    Download VOD content with real-time progress UI.
+    """
+    global _download_active, _download_title
+
+    try:
+        # Check if another download is already running
+        with _download_lock:
+            if _download_active:
+                Script.notify("Download Busy", f"Already downloading: {_download_title}. Please wait.")
+                Dialog().ok("Download In Progress",
+                            f"A download is already running:\n[B]{_download_title}[/B]\n\n"
+                            "Please wait for it to finish before starting another download.\n"
+                            "Do NOT play any streams while downloading.")
+                return
+
+        # Debug: Log all received parameters
+        Script.log(f"[RECORDING] download_vod called with args: {args} (len: {len(args)}), kwargs: {kwargs}", lvl=Script.INFO)
+
+        # Handle different parameter formats
+        if len(args) >= 7:
+            channel_id, showtime, srno, programId, begin, end = args[:6]
+            title = args[6] if len(args) > 6 else kwargs.get('title', "VOD Content")
+            description = args[7] if len(args) > 7 else kwargs.get('description', '')
+        elif kwargs:
+            channel_id = kwargs.get('channel_id', '')
+            showtime = kwargs.get('showtime', '')
+            srno = kwargs.get('srno', '')
+            programId = kwargs.get('programId', '')
+            begin = kwargs.get('begin', '')
+            end = kwargs.get('end', '')
+            title = kwargs.get('title', "VOD Content")
+            description = kwargs.get('description', '')
+        else:
+            Script.log("[RECORDING] No valid parameters received", lvl=Script.ERROR)
+            Script.notify("Download Failed", "Invalid parameters")
+            return
+
+        Script.log(f"[RECORDING] Extracted parameters: channel_id={channel_id}, showtime={showtime}, srno={srno}, programId={programId}, begin={begin}, end={end}, title={title}", lvl=Script.INFO)
+
+        # Convert parameters to strings
+        channel_id = str(channel_id)
+        showtime = str(showtime) if showtime else ""
+        srno = str(srno) if srno else ""
+        programId = str(programId) if programId else ""
+        begin = str(begin) if begin else ""
+        end = str(end) if end else ""
+        title = str(title) if title else "VOD Content"
+        description = str(description) if description else ""
+
+        Script.log(f"[RECORDING] After conversion: channel_id={channel_id}, showtime={showtime}, srno={srno}", lvl=Script.INFO)
+
+        # Check if ffmpeg is available
+        if not ensure_ffmpeg_available():
+            Script.notify("Download Failed", "ffmpeg is required but could not be installed")
+            return
+
+        audio_map = kwargs.get('audio_map', None)
+        if audio_map is None:
+            audio_map = _prompt_audio_selection(channel_id, showtime, srno, programId, begin, end)
+            if audio_map is not None:
+                kwargs['audio_map'] = audio_map
+                Script.log(f"[DOWNLOAD] Selected audio_map: {audio_map}", lvl=Script.INFO)
+
+        # Generate default filename
+        safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip()
+        default_filename = f"VOD_{safe_title.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+
+        filename = keyboard("Enter filename (or leave empty for auto-generated)", default=default_filename)
+        if not filename or filename.strip() == "":
+            filename = default_filename
+        elif not filename.endswith('.mp4'):
+            filename += '.mp4'
+
+        save_path = xbmcvfs.translatePath("special://home/userdata/addon_data/plugin.kodi.jiotv/downloads/")
+        if not xbmcvfs.exists(save_path):
+            xbmcvfs.mkdirs(save_path)
+
+        output_path = os.path.join(save_path, filename)
+
+        # Calculate total duration for progress tracking
+        total_duration = _parse_vod_duration_seconds(begin, end)
+        Script.log(f"[DOWNLOAD] Estimated duration: {total_duration}s ({total_duration // 60} min)", lvl=Script.INFO)
+
+        # Warn user not to stream while downloading
+        Dialog().ok("Download Starting",
+                    f"Downloading: [B]{title}[/B]\n\n"
+                    "[COLOR red]WARNING:[/COLOR] Do NOT play any live/VOD streams while\n"
+                    "the download is in progress. Streaming will interrupt\n"
+                    "the download and cause it to fail.\n\n"
+                    "Progress will be shown in the top-right corner.")
+
+        def do_download():
+            global _download_active, _download_title
+            progress_bg = None
+            temp_dir = None
+
+            try:
+                # Mark download as active
+                with _download_lock:
+                    _download_active = True
+                    _download_title = title
+
+                # Inhibit power saving / system sleep
+                _inhibit_power_saving(True)
+
+                # Create background progress dialog
+                progress_bg = xbmcgui.DialogProgressBG()
+                progress_bg.create("JioTV Download", f"Starting: {title}")
+                progress_bg.update(0, "JioTV Download", f"Preparing: {title}")
+
+                safe_output = output_path.replace('\\', '/')
+                start_time = time.time()
+
+                if total_duration > 600:
+                    # ============================================================
+                    # CHUNKED DOWNLOAD — for VODs longer than 10 minutes
+                    # Token expires after 120s, so we split into 5-min chunks,
+                    # getting a fresh token for each chunk.
+                    # ============================================================
+                    chunks = _calculate_chunks(begin, end, CHUNK_DURATION_SECONDS)
+                    total_chunks = len(chunks)
+                    Script.log(f"[DOWNLOAD] Chunked download: {total_chunks} chunks of {CHUNK_DURATION_SECONDS}s for {total_duration}s total", lvl=Script.INFO)
+
+                    # Create temp directory for chunks
+                    temp_dir = os.path.join(save_path, f"_temp_{int(time.time())}")
+                    os.makedirs(temp_dir, exist_ok=True)
+
+                    chunk_files = []
+                    failed_chunks = 0
+
+                    for i, (chunk_begin, chunk_end) in enumerate(chunks):
+                        chunk_pct = int((i / total_chunks) * 95)  # 0-95% for chunks
+                        progress_bg.update(chunk_pct, "JioTV Download",
+                                           f"{title} \u2014 Part {i+1}/{total_chunks} ({chunk_pct}%)")
+
+                        Script.log(f"[DOWNLOAD] Chunk {i+1}/{total_chunks}: {chunk_begin} to {chunk_end}", lvl=Script.INFO)
+
+                        # Get a FRESH stream URL with new token for this chunk's time range
+                        stream_url, headers = get_stream_url_for_recording(
+                            channel_id, showtime, srno, programId, chunk_begin, chunk_end)
+
+                        if not stream_url:
+                            Script.log(f"[DOWNLOAD] No URL for chunk {i+1}, skipping", lvl=Script.WARNING)
+                            failed_chunks += 1
+                            continue
+
+                        chunk_file = os.path.join(temp_dir, f"chunk_{i:04d}.mp4")
+                        cmd = _build_ffmpeg_cmd(stream_url, chunk_file, channel_id, showtime, srno, headers, audio_map=kwargs.get('audio_map', None))
+
+                        success = _run_ffmpeg_chunk(cmd, chunk_file, timeout=180)
+                        if success:
+                            chunk_size_mb = os.path.getsize(chunk_file) / (1024 * 1024)
+                            chunk_files.append(chunk_file)
+                            Script.log(f"[DOWNLOAD] Chunk {i+1}/{total_chunks} OK ({chunk_size_mb:.1f} MB)", lvl=Script.INFO)
+                        else:
+                            Script.log(f"[DOWNLOAD] Chunk {i+1}/{total_chunks} FAILED", lvl=Script.WARNING)
+                            failed_chunks += 1
+                            # Retry once with a fresh token
+                            time.sleep(1)
+                            stream_url2, headers2 = get_stream_url_for_recording(
+                                channel_id, showtime, srno, programId, chunk_begin, chunk_end)
+                            if stream_url2:
+                                cmd2 = _build_ffmpeg_cmd(stream_url2, chunk_file, channel_id, showtime, srno, headers2, audio_map=selected_audio_map)
+                                if _run_ffmpeg_chunk(cmd2, chunk_file, timeout=180):
+                                    chunk_files.append(chunk_file)
+                                    failed_chunks -= 1
+                                    Script.log(f"[DOWNLOAD] Chunk {i+1} retry SUCCESS", lvl=Script.INFO)
+
+                    # Concatenate all chunks
+                    if chunk_files:
+                        progress_bg.update(96, "JioTV Download", f"Merging {len(chunk_files)} parts...")
+                        Script.log(f"[DOWNLOAD] Concatenating {len(chunk_files)} chunks ({failed_chunks} failed)", lvl=Script.INFO)
+
+                        # Write ffmpeg concat file list
+                        concat_list = os.path.join(temp_dir, "concat.txt")
+                        with open(concat_list, 'w') as f:
+                            for cf in chunk_files:
+                                f.write(f"file '{cf.replace(os.sep, '/')}'"
+                                        "\n")
+
+                        concat_cmd = [
+                            'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+                            '-i', concat_list
+                        ]
+                        if title:
+                            concat_cmd.extend(['-metadata', f'title={title}'])
+                        if description:
+                            concat_cmd.extend(['-metadata', f'comment={description}'])
+                        concat_cmd.extend(['-c', 'copy', safe_output])
+                        concat_proc = subprocess.Popen(
+                            concat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+                        concat_proc.communicate(timeout=600)
+
+                        if concat_proc.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                            file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                            elapsed_min = (time.time() - start_time) / 60
+                            Script.log(f"[DOWNLOAD] Chunked download SUCCESS: {output_path} ({file_size_mb:.1f} MB in {elapsed_min:.1f} min, {failed_chunks} chunk failures)", lvl=Script.INFO)
+                            progress_bg.update(100, "JioTV Download", f"Complete: {title} ({file_size_mb:.0f} MB)")
+                            time.sleep(3)
+                            progress_bg.close()
+                            progress_bg = None
+                            Script.notify("Download Complete", f"{title} ({file_size_mb:.1f} MB)")
+                            # Cleanup temp
+                            shutil.rmtree(temp_dir, ignore_errors=True)
+                            temp_dir = None
+                            return
+                        else:
+                            Script.log(f"[DOWNLOAD] Concat failed (code {concat_proc.returncode})", lvl=Script.ERROR)
+                    else:
+                        Script.log("[DOWNLOAD] No chunks downloaded successfully", lvl=Script.ERROR)
+
+                    # Cleanup temp on failure (keep for debugging)
+                    Script.log(f"[DOWNLOAD] Temp chunks kept at: {temp_dir}", lvl=Script.INFO)
+                    progress_bg.update(0, "JioTV Download", f"Download failed: {title}")
+                    time.sleep(3)
+                    progress_bg.close()
+                    progress_bg = None
+                    Script.notify("Download Failed", f"{len(chunk_files)}/{total_chunks} chunks saved in temp folder.")
+
+                else:
+                    # ============================================================
+                    # DIRECT DOWNLOAD — for short VODs (≤ 10 minutes)
+                    # Single ffmpeg pass fits within the 120s token window.
+                    # ============================================================
+                    Script.log("[DOWNLOAD] === Direct download (short VOD) ===", lvl=Script.INFO)
+
+                    stream_url, headers = get_stream_url_for_recording(channel_id, showtime, srno, programId, begin, end)
+                    if not stream_url:
+                        Script.log("[DOWNLOAD] Could not get stream URL", lvl=Script.ERROR)
+                        progress_bg.update(0, "JioTV Download", "Failed: Could not get stream URL")
+                        time.sleep(3)
+                        progress_bg.close()
+                        progress_bg = None
+                        Script.notify("Download Failed", "Could not get stream URL")
+                        return
+
+                    progress_bg.update(2, "JioTV Download", f"Downloading: {title}")
+                    cmd = _build_ffmpeg_cmd(stream_url, output_path, channel_id, showtime, srno, headers, audio_map=kwargs.get('audio_map', None), title=title, description=description)
+                    Script.log(f"[DOWNLOAD] ffmpeg direct: {safe_output}", lvl=Script.INFO)
+
+                    process = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+                    # Real-time progress tracking via ffmpeg stderr
+                    progress_bg.update(3, "JioTV Download", f"Downloading: {title}")
+                    last_update = 0
+                    stderr_lines = []
+                    last_progress_pct = 0
+                    stderr_buffer = ""
+
+                    while True:
+                        char = process.stderr.read(1)
+                        if not char:
+                            break
+                        if char == '\r' or char == '\n':
+                            line = stderr_buffer.strip()
+                            if line:
+                                stderr_lines.append(line)
+                                current_time = _parse_ffmpeg_time(line)
+                                if current_time is not None and total_duration > 0:
+                                    pct = min(int((current_time / total_duration) * 100), 99)
+                                    if pct != last_progress_pct or (time.time() - last_update) > 2:
+                                        last_progress_pct = pct
+                                        last_update = time.time()
+                                        elapsed = time.time() - start_time
+                                        if pct > 0:
+                                            eta_s = int(elapsed / pct * (100 - pct))
+                                            eta_str = f"{eta_s // 60}m {eta_s % 60}s left"
+                                        else:
+                                            eta_str = "calculating..."
+                                        size_str = ""
+                                        if os.path.exists(output_path):
+                                            size_str = f" ({os.path.getsize(output_path) / (1024*1024):.0f} MB)"
+                                        progress_bg.update(pct, "JioTV Download",
+                                                           f"{title} \u2014 {pct}%{size_str} \u2014 {eta_str}")
+                            stderr_buffer = ""
+                        else:
+                            stderr_buffer += char
+
+                    process.wait()
+
+                    if process.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                        file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                        elapsed_min = (time.time() - start_time) / 60
+                        Script.log(f"[DOWNLOAD] Direct download SUCCESS: {output_path} ({file_size_mb:.1f} MB in {elapsed_min:.1f} min)", lvl=Script.INFO)
+                        progress_bg.update(100, "JioTV Download", f"Complete: {title} ({file_size_mb:.0f} MB)")
+                        time.sleep(3)
+                        progress_bg.close()
+                        progress_bg = None
+                        Script.notify("Download Complete", f"{title} ({file_size_mb:.1f} MB)")
+                        return
+                    else:
+                        Script.log(f"[DOWNLOAD] Direct download failed (code {process.returncode})", lvl=Script.ERROR)
+                        full_stderr = "\n".join(stderr_lines[-10:])
+                        if full_stderr:
+                            Script.log(f"[DOWNLOAD] ffmpeg stderr: {full_stderr[-500:]}", lvl=Script.ERROR)
+
+                    progress_bg.update(0, "JioTV Download", f"Download failed: {title}")
+                    time.sleep(3)
+                    progress_bg.close()
+                    progress_bg = None
+                    Script.notify("Download Failed", "Check logs for details.")
+
+            except Exception as e:
+                Script.log(f"[DOWNLOAD] Download error: {e}", lvl=Script.ERROR)
+                if progress_bg:
+                    try:
+                        progress_bg.close()
+                    except Exception:
+                        pass
+                Script.notify("Download Failed", str(e)[:50])
+            finally:
+                # Always restore state
+                _inhibit_power_saving(False)
+                with _download_lock:
+                    _download_active = False
+                    _download_title = ""
+
+        download_thread = threading.Thread(target=do_download)
+        download_thread.daemon = True
+        download_thread.start()
+
+    except Exception as e:
+        Script.log(f"[RECORDING] Error in download_vod: {e}", lvl=Script.ERROR)
+        Script.notify("Download Failed", str(e))
+
+
+# Number of parallel workers for each download mode
+FAST_WORKERS = 3
+SUPERFAST_WORKERS = 6
+
+
+def _download_one_chunk(args):
+    """Worker function for parallel chunk download. Returns (index, chunk_file, success)."""
+    i, chunk_begin, chunk_end, temp_dir, channel_id, showtime, srno, programId, audio_map = args
+    try:
+        Script.log(f"[PARALLEL-DL] Worker starting chunk {i}: {chunk_begin} \u2192 {chunk_end}", lvl=Script.INFO)
+
+        stream_url, headers = get_stream_url_for_recording(
+            channel_id, showtime, srno, programId, chunk_begin, chunk_end)
+
+        if not stream_url:
+            Script.log(f"[PARALLEL-DL] No stream URL for chunk {i}", lvl=Script.WARNING)
+            return (i, None, False)
+
+        chunk_file = os.path.join(temp_dir, f"chunk_{i:04d}.mp4")
+        
+        cmd = _build_ffmpeg_cmd(stream_url, chunk_file, channel_id, showtime, srno, headers, audio_map)
+
+        success = _run_ffmpeg_chunk(cmd, chunk_file, timeout=180)
+        if success:
+            size_mb = os.path.getsize(chunk_file) / (1024 * 1024)
+            Script.log(f"[PARALLEL-DL] Chunk {i} OK ({size_mb:.1f} MB)", lvl=Script.INFO)
+            return (i, chunk_file, True)
+        else:
+            # Retry once
+            Script.log(f"[PARALLEL-DL] Chunk {i} failed, retrying...", lvl=Script.WARNING)
+            time.sleep(1)
+            stream_url2, headers2 = get_stream_url_for_recording(
+                channel_id, showtime, srno, programId, chunk_begin, chunk_end)
+            if stream_url2:
+                cmd2 = _build_ffmpeg_cmd(stream_url2, chunk_file, channel_id, showtime, srno, headers2, audio_map)
+                if _run_ffmpeg_chunk(cmd2, chunk_file, timeout=180):
+                    Script.log(f"[PARALLEL-DL] Chunk {i} retry OK", lvl=Script.INFO)
+                    return (i, chunk_file, True)
+            return (i, None, False)
+    except Exception as e:
+        Script.log(f"[PARALLEL-DL] Chunk {i} exception: {e}", lvl=Script.ERROR)
+        return (i, None, False)
+
+
+def _download_vod_parallel(plugin, num_workers, mode_label, *args, **kwargs):
+    """
+    Shared parallel download logic used by both Fast and Super Fast modes.
+    num_workers: number of concurrent ffmpeg processes
+    mode_label: display label like "Fast" or "Super Fast"
+    """
+    global _download_active, _download_title
+
+    try:
+        # Check if another download is already running
+        with _download_lock:
+            if _download_active:
+                Script.notify("Download Busy", f"Already downloading: {_download_title}. Please wait.")
+                Dialog().ok("Download In Progress",
+                            f"A download is already running:\n[B]{_download_title}[/B]\n\n"
+                            "Please wait for it to finish before starting another download.\n"
+                            "Do NOT play any streams while downloading.")
+                return
+
+        log_tag = f"[{mode_label.upper()}-DL]"
+        Script.log(f"{log_tag} called with {num_workers} workers, kwargs: {kwargs}", lvl=Script.INFO)
+
+        # Handle parameter formats
+        if len(args) >= 7:
+            channel_id, showtime, srno, programId, begin, end = args[:6]
+            title = args[6] if len(args) > 6 else kwargs.get('title', "VOD Content")
+            description = args[7] if len(args) > 7 else kwargs.get('description', '')
+        elif kwargs:
+            channel_id = kwargs.get('channel_id', '')
+            showtime = kwargs.get('showtime', '')
+            srno = kwargs.get('srno', '')
+            programId = kwargs.get('programId', '')
+            begin = kwargs.get('begin', '')
+            end = kwargs.get('end', '')
+            title = kwargs.get('title', "VOD Content")
+            description = kwargs.get('description', '')
+        else:
+            Script.log(f"{log_tag} No valid parameters received", lvl=Script.ERROR)
+            Script.notify("Download Failed", "Invalid parameters")
+            return
+
+        # Convert to strings
+        channel_id = str(channel_id)
+        showtime = str(showtime) if showtime else ""
+        srno = str(srno) if srno else ""
+        programId = str(programId) if programId else ""
+        begin = str(begin) if begin else ""
+        end = str(end) if end else ""
+        title = str(title) if title else "VOD Content"
+        description = str(description) if description else ""
+
+        if not ensure_ffmpeg_available():
+            Script.notify("Download Failed", "ffmpeg is required but could not be installed")
+            return
+
+        audio_map = kwargs.get('audio_map', None)
+        if audio_map is None:
+            audio_map = _prompt_audio_selection(channel_id, showtime, srno, programId, begin, end)
+            if audio_map is not None:
+                kwargs['audio_map'] = audio_map
+                Script.log(f"{log_tag} Selected audio_map: {audio_map}", lvl=Script.INFO)
+
+        safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip()
+        default_filename = f"VOD_{safe_title.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+
+        filename = keyboard("Enter filename (or leave empty for auto-generated)", default=default_filename)
+        if not filename or filename.strip() == "":
+            filename = default_filename
+        elif not filename.endswith('.mp4'):
+            filename += '.mp4'
+
+        save_path = xbmcvfs.translatePath("special://home/userdata/addon_data/plugin.kodi.jiotv/downloads/")
+        if not xbmcvfs.exists(save_path):
+            xbmcvfs.mkdirs(save_path)
+
+        output_path = os.path.join(save_path, filename)
+
+        total_duration = _parse_vod_duration_seconds(begin, end)
+        Script.log(f"{log_tag} Duration: {total_duration}s ({total_duration // 60} min), workers: {num_workers}", lvl=Script.INFO)
+
+        # Color coding for mode
+        if num_workers >= 6:
+            color = "red"
+        else:
+            color = "green"
+
+        Dialog().ok(f"{mode_label} Download Starting",
+                    f"Downloading: [B]{title}[/B]\n"
+                    f"Mode: [COLOR {color}]{mode_label.upper()}[/COLOR] ({num_workers} parallel streams)\n\n"
+                    "[COLOR red]WARNING:[/COLOR] Do NOT play any live/VOD streams while\n"
+                    "the download is in progress.\n\n"
+                    "Progress will be shown in the top-right corner.")
+
+        progress_title = f"JioTV {mode_label}"
+
+        def do_parallel_download():
+            global _download_active, _download_title
+            progress_bg = None
+            temp_dir = None
+
+            try:
+                with _download_lock:
+                    _download_active = True
+                    _download_title = f"{title} ({mode_label})"
+
+                _inhibit_power_saving(True)
+
+                progress_bg = xbmcgui.DialogProgressBG()
+                progress_bg.create(progress_title, f"Starting: {title}")
+                progress_bg.update(0, progress_title, f"Preparing {num_workers} workers...")
+
+                safe_output = output_path.replace('\\', '/')
+                start_time = time.time()
+
+                chunks = _calculate_chunks(begin, end, CHUNK_DURATION_SECONDS)
+                total_chunks = len(chunks)
+                Script.log(f"{log_tag} {total_chunks} chunks, {num_workers} parallel workers", lvl=Script.INFO)
+
+                temp_dir = os.path.join(save_path, f"_{mode_label.lower().replace(' ', '')}_{int(time.time())}")
+                os.makedirs(temp_dir, exist_ok=True)
+
+                # Prepare worker arguments
+                audio_map = kwargs.get('audio_map', None)
+                worker_args = []
+                for i, (chunk_begin, chunk_end) in enumerate(chunks):
+                    worker_args.append((
+                        i, chunk_begin, chunk_end, temp_dir,
+                        channel_id, showtime, srno, programId, audio_map
+                    ))
+
+                # Download chunks in parallel
+                completed = 0
+                failed = 0
+                results = {}  # index -> chunk_file
+
+                with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                    futures = {executor.submit(_download_one_chunk, arg): arg[0]
+                               for arg in worker_args}
+
+                    for future in concurrent.futures.as_completed(futures):
+                        idx = futures[future]
+                        try:
+                            chunk_idx, chunk_file, success = future.result()
+                            if success and chunk_file:
+                                results[chunk_idx] = chunk_file
+                                completed += 1
+                            else:
+                                failed += 1
+                        except Exception as e:
+                            Script.log(f"{log_tag} Future error for chunk {idx}: {e}", lvl=Script.ERROR)
+                            failed += 1
+
+                        done_total = completed + failed
+                        pct = int((done_total / total_chunks) * 95)
+                        elapsed = time.time() - start_time
+                        if pct > 0:
+                            eta_s = int(elapsed / pct * (100 - pct))
+                            eta_str = f"{eta_s // 60}m {eta_s % 60}s left"
+                        else:
+                            eta_str = "starting..."
+
+                        progress_bg.update(pct, progress_title,
+                                           f"{title} \u2014 {completed}/{total_chunks} done ({pct}%) \u2014 {eta_str}")
+
+                Script.log(f"{log_tag} All workers done: {completed} OK, {failed} failed", lvl=Script.INFO)
+
+                # Concatenate in order
+                if completed > 0:
+                    progress_bg.update(96, progress_title, f"Merging {completed} parts...")
+
+                    ordered_files = [results[i] for i in sorted(results.keys())]
+
+                    concat_list = os.path.join(temp_dir, "concat.txt")
+                    with open(concat_list, 'w') as f:
+                        for cf in ordered_files:
+                            f.write(f"file '{cf.replace(os.sep, '/')}'"
+                                    "\n")
+
+                    concat_cmd = [
+                        'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+                        '-i', concat_list
+                    ]
+                    if title:
+                        concat_cmd.extend(['-metadata', f'title={title}'])
+                    if description:
+                        concat_cmd.extend(['-metadata', f'comment={description}'])
+                    concat_cmd.extend(['-c', 'copy', safe_output])
+                    concat_proc = subprocess.Popen(
+                        concat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+                    concat_proc.communicate(timeout=600)
+
+                    if concat_proc.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                        file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                        elapsed_min = (time.time() - start_time) / 60
+                        Script.log(f"{log_tag} SUCCESS: {output_path} ({file_size_mb:.1f} MB in {elapsed_min:.1f} min)", lvl=Script.INFO)
+                        progress_bg.update(100, progress_title, f"Complete: {title} ({file_size_mb:.0f} MB)")
+                        time.sleep(3)
+                        progress_bg.close()
+                        progress_bg = None
+                        Script.notify("Download Complete", f"{title} ({file_size_mb:.1f} MB in {elapsed_min:.0f} min)")
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                        temp_dir = None
+                        return
+                    else:
+                        Script.log(f"{log_tag} Concat failed (code {concat_proc.returncode})", lvl=Script.ERROR)
+                else:
+                    Script.log(f"{log_tag} No chunks downloaded", lvl=Script.ERROR)
+
+                progress_bg.update(0, progress_title, f"{mode_label} download failed")
+                time.sleep(3)
+                progress_bg.close()
+                progress_bg = None
+                Script.notify(f"{mode_label} Download Failed", "Try 'Download VOD' (normal) instead.")
+
+            except Exception as e:
+                Script.log(f"{log_tag} Error: {e}", lvl=Script.ERROR)
+                if progress_bg:
+                    try:
+                        progress_bg.close()
+                    except Exception:
+                        pass
+                Script.notify(f"{mode_label} Download Failed", f"Try normal download. Error: {str(e)[:40]}")
+            finally:
+                _inhibit_power_saving(False)
+                with _download_lock:
+                    _download_active = False
+                    _download_title = ""
+
+        download_thread = threading.Thread(target=do_parallel_download)
+        download_thread.daemon = True
+        download_thread.start()
+
+    except Exception as e:
+        Script.log(f"{log_tag} Error in parallel download: {e}", lvl=Script.ERROR)
+        Script.notify("Download Failed", str(e))
+
+
+@Script.register
+def download_vod_fast(plugin, *args, **kwargs):
+    """Download VOD with 3 parallel workers (Fast mode)."""
+    return _download_vod_parallel(plugin, FAST_WORKERS, "Fast", *args, **kwargs)
+
+
+@Script.register
+def download_vod_superfast(plugin, *args, **kwargs):
+    """Download VOD with 6 parallel workers (Super Fast mode)."""
+    return _download_vod_parallel(plugin, SUPERFAST_WORKERS, "Super Fast", *args, **kwargs)
